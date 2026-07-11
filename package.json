@@ -1,0 +1,15 @@
+{
+  "name": "acme-control-plane",
+  "version": "1.0.0",
+  "description": "Acme Signage tenant control plane worker",
+  "main": "src/index.mjs",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check src/index.mjs && node --check src/tenant_region_do.mjs && node --check src/settings_scope_do.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module"
+}
