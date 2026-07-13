@@ -65,6 +65,23 @@ CREATE TABLE IF NOT EXISTS settings_current (
   state_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS region_assets (
+  asset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant TEXT NOT NULL,
+  region TEXT NOT NULL,
+  zone TEXT NOT NULL,
+  r2_key TEXT NOT NULL,
+  public_url TEXT NOT NULL,
+  filename_original TEXT NOT NULL,
+  filename_display TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_hb_tenant_region_ts ON heartbeat_events(tenant, region, ts);
 CREATE INDEX IF NOT EXISTS idx_hb_tenant_region_device_ts ON heartbeat_events(tenant, region, device_id, ts);
 CREATE INDEX IF NOT EXISTS idx_devices_tenant_region ON devices(tenant, region);
@@ -72,4 +89,5 @@ CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen);
 CREATE INDEX IF NOT EXISTS idx_settings_events_scope_ts ON settings_events(scope, ts);
 CREATE INDEX IF NOT EXISTS idx_settings_events_tenant_region_zone_ts ON settings_events(tenant, region, zone, ts);
 CREATE INDEX IF NOT EXISTS idx_settings_current_tenant_region_zone ON settings_current(tenant, region, zone);
-
+CREATE INDEX IF NOT EXISTS idx_region_assets_tenant_region_zone_created ON region_assets(tenant, region, zone, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_region_assets_r2_key ON region_assets(r2_key);

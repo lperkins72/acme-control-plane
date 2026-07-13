@@ -2,11 +2,13 @@
 
 ## Purpose
 
-This repository is the tenant-specific production control plane for Acme Signage.
+This repository is the live Acme content and presence control plane worker.
 
 It is intentionally separate from:
 
 - [BDN-control-plane](C:/BeaconSignageCore/BDN-control-plane/README.md)
+- the tenant auth/routing worker
+- the tenant client portal
 
 The older control plane remains the demo/proof-of-concept reference.
 
@@ -29,21 +31,18 @@ Example:
 
 Those must remain separate everywhere in routing, storage, scopes, and live region state.
 
-## Wave 1 Scope
+## Scope
 
-Wave 1 covers:
+This worker currently owns the Acme live content plane for:
 
-- tenant-aware identity
-- tenant-aware sync scopes
-- tenant-aware Durable Object naming
-- tenant-aware D1 schema
-- tenant-first API route shape
+- heartbeat ingest and live presence reads
+- region and device settings reads/writes
+- playlist and manifest publish flows
+- primary and footer asset upload helpers
+- region live state fan-out
+- public asset serving for uploaded footer files
 
-It does not yet include:
-
-- full multi-tenant admin UI
-- tenant-scoped operator auth
-- deployment automation
+It is deliberately not the auth boundary. Operator identity and tenant-scoped session handling are handled by the separate tenant control-plane worker.
 
 ## Primary Documents
 
@@ -53,12 +52,26 @@ It does not yet include:
 
 ## Current Status
 
-This repo now contains the Wave 1 tenant-aware backend baseline:
+This worker is deployed and in active use by the Acme tenant portal and Acme signage fleet.
+
+Current live capabilities include:
 
 - tenant-aware heartbeat ingest
 - tenant-aware settings read/write routes
 - tenant-aware websocket fan-out
 - tenant, region, and device inventory routes
 - tenant-region Durable Object live state
+- primary asset and footer asset support for the portal
 
-It is still not deployed yet.
+Current architecture split:
+
+- `acme-control-plane`
+  owns live content, manifests, assets, and presence
+- `bdn-tenant-control-plane`
+  owns user identity, routing admin, and tenant-scoped auth decisions
+
+## Deployment Notes
+
+- this worker is deployed manually with Wrangler
+- GitHub push does not by itself publish this worker
+- keep CORS/auth origin settings aligned with the Pages portal URL in [wrangler.jsonc](C:/BeaconSignageCore/acme-control-plane/wrangler.jsonc)
