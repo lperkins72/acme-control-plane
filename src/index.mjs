@@ -637,6 +637,223 @@ async function listRegionAssets(env, tenant, region, zone) {
   }));
 }
 
+async function readActiveRegionAssetById(env, tenant, region, zone, assetId) {
+  if (!env.DB) return null;
+  const numericAssetId = Number(assetId);
+  if (!Number.isFinite(numericAssetId) || numericAssetId <= 0) {
+    return null;
+  }
+
+  const result = await env.DB.prepare(`
+    SELECT asset_id, tenant, region, zone, r2_key, public_url, filename_original, filename_display, content_type, size_bytes, status, created_by, created_at, updated_at
+    FROM region_assets
+    WHERE asset_id = ? AND tenant = ? AND region = ? AND zone = ? AND status = 'active'
+    LIMIT 1
+  `).bind(numericAssetId, tenant, region, zone).first();
+
+  if (!result) {
+    return null;
+  }
+
+  return {
+    asset_id: Number(result.asset_id),
+    tenant: sanitizeString(result.tenant, 64),
+    region: sanitizeString(result.region, 16),
+    zone: sanitizeString(result.zone, 20),
+    r2_key: sanitizeString(result.r2_key, 500),
+    public_url: sanitizeString(result.public_url, 500),
+    filename_original: sanitizeString(result.filename_original, 240),
+    filename_display: sanitizeString(result.filename_display, 240),
+    content_type: sanitizeString(result.content_type, 120),
+    size_bytes: Number(result.size_bytes || 0),
+    status: sanitizeString(result.status, 20),
+    created_by: sanitizeString(result.created_by || "", 120),
+    created_at: sanitizeString(result.created_at, 40),
+    updated_at: sanitizeString(result.updated_at, 40)
+  };
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function listPlaylistsReferencingSrc(playlists, src) {
+  if (!isPlainObject(playlists) || !src) {
+    return [];
+  }
+
+  const matches = [];
+  for (const [name, items] of Object.entries(playlists)) {
+    if (!Array.isArray(items)) {
+      continue;
+    }
+    if (items.some((item) => sanitizeString(item?.src, 500) === src)) {
+      matches.push(name);
+    }
+  }
+  return matches;
+}
+
+function removeSrcFromPlaylists(playlists, src) {
+  const nextPlaylists = isPlainObject(playlists) ? cloneJson(playlists) : {};
+  const cleanedPlaylists = [];
+
+  for (const [name, items] of Object.entries(nextPlaylists)) {
+    if (!Array.isArray(items)) {
+      continue;
+    }
+    const filtered = items.filter((item) => sanitizeString(item?.src, 500) !== src);
+    if (filtered.length !== items.length) {
+      cleanedPlaylists.push(name);
+      nextPlaylists[name] = filtered;
+    }
+  }
+
+  return {
+    playlists: nextPlaylists,
+    cleaned_playlists: cleanedPlaylists
+  };
+}
+
+function listFooterOverlaysReferencingPath(state, path) {
+  const overlays = Array.isArray(state?.overlays) ? state.overlays : [];
+  const matches = [];
+  overlays.forEach((overlay, index) => {
+    if (sanitizeString(overlay?.imagePath, 500) === path) {
+      matches.push(index + 1);
+    }
+  });
+  return matches;
+}
+
+function removeFooterPathReferences(state, path) {
+  const nextState = isPlainObject(state) ? cloneJson(state) : {};
+  const overlays = Array.isArray(nextState.overlays) ? nextState.overlays : [];
+  const cleanedOverlays = [];
+
+  overlays.forEach((overlay, index) => {
+    if (sanitizeString(overlay?.imagePath, 500) !== path) {
+      return;
+    }
+    cleanedOverlays.push(index + 1);
+    overlay.imagePath = "";
+    if (String(overlay.type || "") === "image") {
+      overlay.enabled = false;
+      overlay.type = "none";
+    }
+  });
+
+  return {
+    state: nextState,
+    cleaned_overlays: cleanedOverlays
+  };
+}
+
+async function markRegionAssetDeleted(env, asset, deletedBy) {
+  if (!env.DB || !asset?.asset_id) {
+    return;
+  }
+  const updatedAt = new Date().toISOString();
+  await env.DB.prepare(`
+    UPDATE region_assets
+    SET status = 'deleted', updated_at = ?, created_by = COALESCE(created_by, ?)
+    WHERE asset_id = ?
+  `).bind(updatedAt, deletedBy, asset.asset_id).run();
+}
+
+async function writeScopeStateFromMeta(env, scopeMeta, stateValue, updatedBy, now, request) {
+  const current = await readCurrentScopeState(env, scopeMeta.scope);
+  const nextRevision = current.revision + 1;
+  const updatedAt = new Date().toISOString();
+  const changeKind = detectChangeKind(scopeMeta);
+  const changeScope = scopeMeta.scope_type === "region" ? "region" : "device";
+  const sourceOrigin = sanitizeString(request.headers.get("Origin") || "", 200);
+  const stateJson = JSON.stringify(stateValue || {});
+
+  await env.DB.prepare(`
+    INSERT INTO settings_current
+    (scope, scope_type, tenant, region, device_id, zone, mode, revision, updated_at, updated_by, state_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(scope) DO UPDATE SET
+      scope_type=excluded.scope_type,
+      tenant=excluded.tenant,
+      region=excluded.region,
+      device_id=excluded.device_id,
+      zone=excluded.zone,
+      mode=excluded.mode,
+      revision=excluded.revision,
+      updated_at=excluded.updated_at,
+      updated_by=excluded.updated_by,
+      state_json=excluded.state_json
+  `).bind(
+    scopeMeta.scope,
+    scopeMeta.scope_type,
+    scopeMeta.tenant,
+    scopeMeta.region,
+    scopeMeta.device_id,
+    scopeMeta.zone,
+    scopeMeta.mode,
+    nextRevision,
+    updatedAt,
+    updatedBy,
+    stateJson
+  ).run();
+
+  try {
+    await env.DB.prepare(`
+      INSERT INTO settings_events
+      (ts, scope, scope_type, tenant, region, device_id, zone, mode, revision, updated_at, updated_by, change_kind, change_scope, source_origin, state_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      now,
+      scopeMeta.scope,
+      scopeMeta.scope_type,
+      scopeMeta.tenant,
+      scopeMeta.region,
+      scopeMeta.device_id,
+      scopeMeta.zone,
+      scopeMeta.mode,
+      nextRevision,
+      updatedAt,
+      updatedBy,
+      changeKind,
+      changeScope,
+      sourceOrigin,
+      stateJson
+    ).run();
+  } catch {
+    // Audit logging is best-effort.
+  }
+
+  const id = env.SETTINGS_SCOPE_DO.idFromName(scopeMeta.scope);
+  const stub = env.SETTINGS_SCOPE_DO.get(id);
+  const currentResponse = {
+    ok: true,
+    state: stateValue || {},
+    meta: {
+      updatedAt,
+      updatedBy,
+      revision: nextRevision,
+      changeKind,
+      changeScope,
+      sourceOrigin
+    },
+    revision: nextRevision
+  };
+
+  try {
+    await stub.fetch(`https://scope/${encodeURIComponent(scopeMeta.scope)}/notify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(currentResponse)
+    });
+  } catch {
+    // Websocket fan-out is best-effort.
+  }
+
+  return currentResponse;
+}
+
 async function buildPrimaryConfigResponse(env, request, tenant, region) {
   const pagesProjectUrl = defaultRegionPagesProjectUrl(tenant, region);
   let manifest = { defaultDurationSeconds: 5, items: [] };
@@ -756,96 +973,7 @@ async function buildFooterAssetsResponse(env, request, tenant, region) {
 
 async function writePrimaryScopeState(env, tenant, region, stateValue, updatedBy, now, request) {
   const scopeMeta = parseScope(buildPrimaryScope(tenant, region));
-  const current = await readCurrentScopeState(env, scopeMeta.scope);
-  const nextRevision = current.revision + 1;
-  const updatedAt = new Date().toISOString();
-  const changeKind = detectChangeKind(scopeMeta);
-  const changeScope = "region";
-  const sourceOrigin = sanitizeString(request.headers.get("Origin") || "", 200);
-  const stateJson = JSON.stringify(stateValue || {});
-
-  await env.DB.prepare(`
-    INSERT INTO settings_current
-    (scope, scope_type, tenant, region, device_id, zone, mode, revision, updated_at, updated_by, state_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(scope) DO UPDATE SET
-      scope_type=excluded.scope_type,
-      tenant=excluded.tenant,
-      region=excluded.region,
-      device_id=excluded.device_id,
-      zone=excluded.zone,
-      mode=excluded.mode,
-      revision=excluded.revision,
-      updated_at=excluded.updated_at,
-      updated_by=excluded.updated_by,
-      state_json=excluded.state_json
-  `).bind(
-    scopeMeta.scope,
-    scopeMeta.scope_type,
-    scopeMeta.tenant,
-    scopeMeta.region,
-    scopeMeta.device_id,
-    scopeMeta.zone,
-    scopeMeta.mode,
-    nextRevision,
-    updatedAt,
-    updatedBy,
-    stateJson
-  ).run();
-
-  try {
-    await env.DB.prepare(`
-      INSERT INTO settings_events
-      (ts, scope, scope_type, tenant, region, device_id, zone, mode, revision, updated_at, updated_by, change_kind, change_scope, source_origin, state_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      now,
-      scopeMeta.scope,
-      scopeMeta.scope_type,
-      scopeMeta.tenant,
-      scopeMeta.region,
-      scopeMeta.device_id,
-      scopeMeta.zone,
-      scopeMeta.mode,
-      nextRevision,
-      updatedAt,
-      updatedBy,
-      changeKind,
-      changeScope,
-      sourceOrigin,
-      stateJson
-    ).run();
-  } catch {
-    // Audit logging is best-effort.
-  }
-
-  const id = env.SETTINGS_SCOPE_DO.idFromName(scopeMeta.scope);
-  const stub = env.SETTINGS_SCOPE_DO.get(id);
-  const currentResponse = {
-    ok: true,
-    state: stateValue || {},
-    meta: {
-      updatedAt,
-      updatedBy,
-      revision: nextRevision,
-      changeKind,
-      changeScope,
-      sourceOrigin
-    },
-    revision: nextRevision
-  };
-
-  try {
-    await stub.fetch(`https://scope/${encodeURIComponent(scopeMeta.scope)}/notify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(currentResponse)
-    });
-  } catch {
-    // Websocket fan-out is best-effort.
-  }
-
-  return currentResponse;
+  return writeScopeStateFromMeta(env, scopeMeta, stateValue, updatedBy, now, request);
 }
 
 function getTenantRegionStub(env, tenant, region) {
@@ -1191,6 +1319,70 @@ export default {
       if (
         tenant &&
         region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "footer-assets" &&
+        request.method === "DELETE"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        if (!env.SCREENS_BUCKET) {
+          return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+        }
+
+        const asset = await readActiveRegionAssetById(env, tenant, region, "footer", parts[6]);
+        if (!asset) {
+          return json({ ok: false, error: "asset_not_found" }, 404);
+        }
+
+        const footerScopeMeta = parseScope(`bdn:v1:tenant:${tenant}:region:${region}:zone:footer`);
+        const currentFooter = await readCurrentScopeState(env, footerScopeMeta.scope);
+        const referencedOverlays = listFooterOverlaysReferencingPath(currentFooter.state, asset.public_url);
+        const cleanupReferences = url.searchParams.get("cleanup") === "references";
+
+        if (referencedOverlays.length && !cleanupReferences) {
+          return json({
+            ok: false,
+            error: "asset_in_use",
+            references: {
+              overlays: referencedOverlays
+            }
+          }, 409);
+        }
+
+        if (referencedOverlays.length && cleanupReferences) {
+          const cleaned = removeFooterPathReferences(currentFooter.state, asset.public_url);
+          await writeScopeStateFromMeta(
+            env,
+            footerScopeMeta,
+            cleaned.state,
+            "portal-admin",
+            now,
+            request
+          );
+        }
+
+        await env.SCREENS_BUCKET.delete(asset.r2_key);
+        await markRegionAssetDeleted(env, asset, "portal-admin");
+
+        return json({
+          ok: true,
+          deleted_asset_id: asset.asset_id,
+          zone: "footer",
+          cleanup_applied: cleanupReferences && referencedOverlays.length > 0,
+          references_removed: {
+            overlays: cleanupReferences ? referencedOverlays : []
+          }
+        });
+      }
+
+      if (
+        tenant &&
+        region &&
         parts.length === 6 &&
         parts[3] === "regions" &&
         parts[5] === "primary-config" &&
@@ -1323,6 +1515,80 @@ export default {
             type: primaryType,
             source: "uploaded",
             created_at: nowIso
+          }
+        });
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "primary-assets" &&
+        request.method === "DELETE"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        if (!env.SCREENS_BUCKET) {
+          return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+        }
+
+        const asset = await readActiveRegionAssetById(env, tenant, region, "primary", parts[6]);
+        if (!asset) {
+          return json({ ok: false, error: "asset_not_found" }, 404);
+        }
+
+        const primaryScopeMeta = parseScope(buildPrimaryScope(tenant, region));
+        const currentPrimary = await readCurrentScopeState(env, primaryScopeMeta.scope);
+        const currentPlaylists = isPlainObject(currentPrimary.state?.playlists) ? currentPrimary.state.playlists : {};
+        const referencedPlaylists = listPlaylistsReferencingSrc(currentPlaylists, asset.public_url);
+        const cleanupReferences = url.searchParams.get("cleanup") === "references";
+
+        if (referencedPlaylists.length && !cleanupReferences) {
+          return json({
+            ok: false,
+            error: "asset_in_use",
+            references: {
+              playlists: referencedPlaylists
+            }
+          }, 409);
+        }
+
+        if (referencedPlaylists.length && cleanupReferences) {
+          const cleaned = removeSrcFromPlaylists(currentPlaylists, asset.public_url);
+          const nextState = {
+            ...(isPlainObject(currentPrimary.state) ? cloneJson(currentPrimary.state) : {}),
+            playlists: cleaned.playlists
+          };
+          const activePlaylistName = sanitizeString(nextState.activePlaylistName, 80);
+          if (activePlaylistName && !nextState.playlists[activePlaylistName]) {
+            nextState.activePlaylistName = Object.keys(nextState.playlists)[0] || "Default";
+          }
+
+          await writeScopeStateFromMeta(
+            env,
+            primaryScopeMeta,
+            nextState,
+            "portal-admin",
+            now,
+            request
+          );
+        }
+
+        await env.SCREENS_BUCKET.delete(asset.r2_key);
+        await markRegionAssetDeleted(env, asset, "portal-admin");
+
+        return json({
+          ok: true,
+          deleted_asset_id: asset.asset_id,
+          zone: "primary",
+          cleanup_applied: cleanupReferences && referencedPlaylists.length > 0,
+          references_removed: {
+            playlists: cleanupReferences ? referencedPlaylists : []
           }
         });
       }
