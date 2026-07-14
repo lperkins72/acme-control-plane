@@ -12,7 +12,7 @@ const MAX_PRIMARY_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_FOOTER_UPLOAD_BYTES = 12 * 1024 * 1024;
 const VALID_ZONES = new Set(["primary", "secondary", "trivia", "footer"]);
 const REGION_SCOPED_ZONES = new Set(["primary", "trivia", "footer"]);
-const DEVICE_SCOPED_ZONES = new Set(["secondary"]);
+const DEVICE_SCOPED_ZONES = new Set(["primary", "secondary"]);
 const ALLOWED_OVERRIDE_MODES = new Set(["region-default", "device-override", "device-only"]);
 const PRIMARY_UPLOAD_TYPES = new Map([
   ["image/jpeg", "image"],
@@ -35,7 +35,7 @@ const CORS_HEADERS = {
   "Cache-Control": "no-store",
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type"
+  "Access-Control-Allow-Headers": "Content-Type, X-BDN-Updated-By"
 };
 
 function parseAllowedOrigins(value) {
@@ -161,7 +161,7 @@ function parseScope(scope) {
     };
   }
 
-  const deviceMatch = /^bdn:v1:tenant:([^:]+):device:(reg\d{2}):(nuc-\d{3}):zone:(secondary)$/i.exec(raw);
+  const deviceMatch = /^bdn:v1:tenant:([^:]+):device:(reg\d{2}):(nuc-\d{3}):zone:(primary|secondary)$/i.exec(raw);
   if (deviceMatch) {
     const tenant = normalizeTenant(deviceMatch[1]);
     const region = normalizeRegion(deviceMatch[2]);
@@ -176,7 +176,7 @@ function parseScope(scope) {
       region,
       device_id: deviceId,
       zone,
-      mode: "device-only"
+      mode: zone === "primary" ? "device-override" : "device-only"
     };
   }
 
@@ -239,6 +239,10 @@ function defaultRegionPagesProjectUrl(tenant, region) {
 
 function buildPrimaryScope(tenant, region) {
   return `bdn:v1:tenant:${tenant}:region:${region}:zone:primary`;
+}
+
+function buildPrimaryDeviceScope(tenant, region, deviceId) {
+  return `bdn:v1:tenant:${tenant}:device:${region}:${deviceId}:zone:primary`;
 }
 
 function buildZoneAssetPublicUrl(request, tenant, region, zone, assetName) {
@@ -984,7 +988,50 @@ function getTenantRegionStub(env, tenant, region) {
 async function fetchTenantRegionItems(env, tenant, region, search = "") {
   const stub = getTenantRegionStub(env, tenant, region);
   const resp = await stub.fetch(`https://do/${tenant}/${region}/list${search}`);
-  return resp.json();
+  const payload = await resp.json();
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+
+  if (env.DB && items.length) {
+    const primaryOverrideRows = await env.DB.prepare(`
+      SELECT device_id
+      FROM settings_current
+      WHERE tenant = ? AND region = ? AND zone = 'primary' AND scope_type = 'device'
+    `).bind(tenant, region).all();
+
+    const pinnedDeviceIds = new Set(
+      Array.isArray(primaryOverrideRows?.results)
+        ? primaryOverrideRows.results.map((row) => normalizeDeviceId(row?.device_id || "")).filter(Boolean)
+        : []
+    );
+
+    payload.items = items.map((item) => {
+      const deviceId = normalizeDeviceId(item?.device_id || "");
+      if (!deviceId || !pinnedDeviceIds.has(deviceId)) {
+        return item;
+      }
+
+      const nextOverrideSummary = isPlainObject(item?.override_summary)
+        ? cloneJson(item.override_summary)
+        : {};
+      nextOverrideSummary.primary = {
+        mode: "device-override",
+        hasOverride: true
+      };
+
+      const nextScopeSummary = isPlainObject(item?.scope_summary)
+        ? cloneJson(item.scope_summary)
+        : {};
+      nextScopeSummary.primary = buildPrimaryDeviceScope(tenant, region, deviceId);
+
+      return {
+        ...item,
+        override_summary: nextOverrideSummary,
+        scope_summary: nextScopeSummary
+      };
+    });
+  }
+
+  return payload;
 }
 
 function buildOverrideSummary(tenant, region, items, offlineMs) {
@@ -1607,6 +1654,74 @@ export default {
       if (request.method === "GET") {
         const current = await readCurrentScopeState(env, scopeMeta.scope);
         return json({ ok: true, ...current });
+      }
+
+      if (request.method === "DELETE") {
+        const current = await readCurrentScopeState(env, scopeMeta.scope);
+        const updatedAt = new Date().toISOString();
+        const fallbackUpdater = scopeMeta.scope_type === "region" ? "region-admin" : "device-admin";
+        const updatedBy = normalizeUpdatedBy(request.headers.get("X-BDN-Updated-By"), fallbackUpdater);
+        const changeKind = `${detectChangeKind(scopeMeta)}-cleared`;
+        const changeScope = scopeMeta.scope_type === "region" ? "region" : "device";
+        const sourceOrigin = sanitizeString(request.headers.get("Origin") || "", 200);
+
+        await env.DB.prepare(`DELETE FROM settings_current WHERE scope = ?`).bind(scopeMeta.scope).run();
+
+        try {
+          await env.DB.prepare(`
+            INSERT INTO settings_events
+            (ts, scope, scope_type, tenant, region, device_id, zone, mode, revision, updated_at, updated_by, change_kind, change_scope, source_origin, state_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            now,
+            scopeMeta.scope,
+            scopeMeta.scope_type,
+            scopeMeta.tenant,
+            scopeMeta.region,
+            scopeMeta.device_id,
+            scopeMeta.zone,
+            scopeMeta.mode,
+            0,
+            updatedAt,
+            updatedBy,
+            changeKind,
+            changeScope,
+            sourceOrigin,
+            "null"
+          ).run();
+        } catch {
+          // Audit logging is best-effort during rollout.
+        }
+
+        const id = env.SETTINGS_SCOPE_DO.idFromName(scopeMeta.scope);
+        const stub = env.SETTINGS_SCOPE_DO.get(id);
+        const clearedResponse = {
+          ok: true,
+          state: null,
+          meta: {
+            updatedAt,
+            updatedBy,
+            revision: 0,
+            changeKind,
+            changeScope,
+            sourceOrigin,
+            deleted: true,
+            previousRevision: current.revision || 0
+          },
+          revision: 0
+        };
+
+        try {
+          await stub.fetch(`https://scope/${encodeURIComponent(scopeMeta.scope)}/notify`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(clearedResponse)
+          });
+        } catch {
+          // Websocket fan-out is best-effort.
+        }
+
+        return json(clearedResponse);
       }
 
       if (request.method === "POST") {
