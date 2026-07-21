@@ -10,15 +10,35 @@ const MAX_SETTINGS_BODY_BYTES = 128 * 1024;
 const MAX_HEARTBEAT_BODY_BYTES = 64 * 1024;
 const MAX_PRIMARY_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_FOOTER_UPLOAD_BYTES = 12 * 1024 * 1024;
-const VALID_ZONES = new Set(["primary", "secondary", "trivia", "footer"]);
-const REGION_SCOPED_ZONES = new Set(["primary", "trivia", "footer"]);
+const MAX_MAIN_OVERLAY_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_TRIVIA_OVERLAY_UPLOAD_BYTES = 25 * 1024 * 1024;
+const VALID_ZONES = new Set(["primary", "secondary", "trivia", "footer", "main-overlay", "trivia-overlay"]);
+const REGION_SCOPED_ZONES = new Set(["primary", "trivia", "footer", "main-overlay", "trivia-overlay"]);
 const DEVICE_SCOPED_ZONES = new Set(["primary", "secondary"]);
 const ALLOWED_OVERRIDE_MODES = new Set(["region-default", "device-override", "device-only"]);
+const MAIN_OVERLAY_INTERVALS = new Set([15, 30, 60]);
+const TRIVIA_OVERLAY_ALLOWED_DURATIONS = new Set([22, 44, 66]);
 const PRIMARY_UPLOAD_TYPES = new Map([
   ["image/jpeg", "image"],
   ["image/png", "image"],
   ["image/webp", "image"],
   ["video/mp4", "video"]
+]);
+const MAIN_OVERLAY_UPLOAD_TYPES = new Set([
+  "video/mp4",
+  "video/webm",
+  "video/ogg"
+]);
+const TRIVIA_OVERLAY_UPLOAD_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/svg+xml",
+  "video/mp4",
+  "video/webm",
+  "video/ogg",
+  "text/html"
 ]);
 const FOOTER_UPLOAD_TYPES = new Set([
   "image/jpeg",
@@ -515,6 +535,76 @@ function normalizeFooterManifestPayload(payload) {
   };
 }
 
+function sanitizeMainSponsorInterval(value) {
+  const numeric = Number(value);
+  return MAIN_OVERLAY_INTERVALS.has(numeric) ? numeric : 0;
+}
+
+function normalizeMainSponsorPath(value) {
+  const raw = sanitizeString(value, 500);
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith("assets/")) return raw;
+  if (!raw.includes("/")) return `assets/${raw}`;
+  return raw;
+}
+
+function normalizeTriviaOverlaySource(value) {
+  const raw = sanitizeString(value, 500);
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith("assets/")) return raw;
+  if (!raw.includes("/")) return `assets/${raw}`;
+  return raw;
+}
+
+function inferTriviaOverlayType(src) {
+  const cleanSrc = String(src || "").split(/[?#]/, 1)[0];
+  const extension = cleanSrc.includes(".") ? cleanSrc.split(".").pop().toLowerCase() : "";
+  if (["mp4", "webm", "ogg"].includes(extension)) return "video";
+  if (["html", "htm"].includes(extension)) return "iframe";
+  return "image";
+}
+
+function normalizeTriviaOverlayType(type, src) {
+  const normalized = sanitizeString(type, 20).toLowerCase();
+  if (normalized === "image" || normalized === "video" || normalized === "iframe") {
+    return normalized;
+  }
+  return inferTriviaOverlayType(src);
+}
+
+function normalizeTriviaOverlayDuration(value) {
+  const numeric = Number(value);
+  return TRIVIA_OVERLAY_ALLOWED_DURATIONS.has(numeric) ? numeric : 22;
+}
+
+function sanitizeTriviaOverlayItem(item) {
+  if (!isPlainObject(item)) {
+    return null;
+  }
+  const src = normalizeTriviaOverlaySource(item.src);
+  if (!src) {
+    return null;
+  }
+  return {
+    src,
+    type: normalizeTriviaOverlayType(item.type, src),
+    durationSeconds: normalizeTriviaOverlayDuration(item.durationSeconds)
+  };
+}
+
+function inferRegionAssetType(contentType, filename) {
+  const normalizedType = sanitizeString(contentType, 120).toLowerCase();
+  if (normalizedType.startsWith("video/")) {
+    return "video";
+  }
+  if (normalizedType === "text/html") {
+    return "iframe";
+  }
+  return inferTriviaOverlayType(filename);
+}
+
 function buildDefaultPrimaryPlaylists(manifest) {
   return {
     Default: manifest.items.map((item) => ({
@@ -606,7 +696,14 @@ function normalizePrimaryState(payload, manifest) {
       playlists,
       activePlaylistName: resolvedActivePlaylistName,
       dissolveEnabled: Boolean(payload.dissolveEnabled),
-      dissolveDuration: sanitizePositiveNumber(payload.dissolveDuration, 0.8, 0.2, 10)
+      dissolveDuration: sanitizePositiveNumber(payload.dissolveDuration, 0.8, 0.2, 10),
+      sponsorVideo: normalizeMainSponsorPath(payload.sponsorVideo),
+      sponsorInterval: sanitizeMainSponsorInterval(payload.sponsorInterval),
+      overlayEnabled: Boolean(payload.overlayEnabled),
+      overlayPlaylist: Array.isArray(payload.overlayPlaylist)
+        ? payload.overlayPlaylist.map(sanitizeTriviaOverlayItem).filter(Boolean)
+        : [],
+      overlayStartEpoch: Math.max(0, Math.floor(Number(payload.overlayStartEpoch) || 0))
     }
   };
 }
@@ -635,9 +732,7 @@ async function listRegionAssets(env, tenant, region, zone) {
     created_by: sanitizeString(row.created_by || "", 120),
     created_at: sanitizeString(row.created_at, 40),
     updated_at: sanitizeString(row.updated_at, 40),
-    type: sanitizeString(row.content_type, 120).toLowerCase().startsWith("video/")
-      ? "video"
-      : "image"
+    type: inferRegionAssetType(row.content_type, row.filename_display || row.filename_original || row.public_url)
   }));
 }
 
@@ -750,6 +845,54 @@ function removeFooterPathReferences(state, path) {
   return {
     state: nextState,
     cleaned_overlays: cleanedOverlays
+  };
+}
+
+function mainOverlayReferencesAsset(state, path) {
+  return sanitizeString(state?.sponsorVideo, 500) === path;
+}
+
+function removeMainOverlayAssetReference(state, path) {
+  const nextState = isPlainObject(state) ? cloneJson(state) : {};
+  const referenced = sanitizeString(nextState.sponsorVideo, 500) === path;
+  if (referenced) {
+    nextState.sponsorVideo = "";
+    nextState.sponsorInterval = 0;
+  }
+  return {
+    state: nextState,
+    cleaned_main_overlay: referenced
+  };
+}
+
+function listTriviaOverlayRowsReferencingSrc(state, src) {
+  const playlist = Array.isArray(state?.overlayPlaylist) ? state.overlayPlaylist : [];
+  const matches = [];
+  playlist.forEach((item, index) => {
+    if (sanitizeString(item?.src, 500) === src) {
+      matches.push(index + 1);
+    }
+  });
+  return matches;
+}
+
+function removeTriviaOverlaySrcReferences(state, src) {
+  const nextState = isPlainObject(state) ? cloneJson(state) : {};
+  const playlist = Array.isArray(nextState.overlayPlaylist) ? nextState.overlayPlaylist : [];
+  const cleanedRows = [];
+  nextState.overlayPlaylist = playlist.filter((item, index) => {
+    const matched = sanitizeString(item?.src, 500) === src;
+    if (matched) {
+      cleanedRows.push(index + 1);
+    }
+    return !matched;
+  });
+  if (!nextState.overlayPlaylist.length) {
+    nextState.overlayEnabled = false;
+  }
+  return {
+    state: nextState,
+    cleaned_rows: cleanedRows
   };
 }
 
@@ -972,6 +1115,26 @@ async function buildFooterAssetsResponse(env, request, tenant, region) {
     },
     manifest,
     asset_library: assetLibrary
+  };
+}
+
+async function buildOverlayAssetsResponse(env, request, tenant, region, zone) {
+  const uploadedAssets = await listRegionAssets(env, tenant, region, zone);
+  return {
+    ok: true,
+    tenant,
+    region,
+    zone,
+    source: {
+      pages_project_url: defaultRegionPagesProjectUrl(tenant, region),
+      sync_url: new URL(request.url).origin
+    },
+    asset_library: uploadedAssets.map((item) => ({
+      ...item,
+      src: item.public_url,
+      public_url: item.public_url,
+      label: sanitizeString(item.filename_original || item.filename_display || item.public_url, 240)
+    }))
   };
 }
 
@@ -1423,6 +1586,346 @@ export default {
           cleanup_applied: cleanupReferences && referencedOverlays.length > 0,
           references_removed: {
             overlays: cleanupReferences ? referencedOverlays : []
+          }
+        });
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 6 &&
+        parts[3] === "regions" &&
+        parts[5] === "main-overlay-assets" &&
+        request.method === "GET"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        return json(await buildOverlayAssetsResponse(env, request, tenant, region, "main-overlay"));
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "main-overlay-assets" &&
+        parts[6] === "upload" &&
+        request.method === "POST"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        if (!env.SCREENS_BUCKET) {
+          return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+        }
+        const contentLength = Number(request.headers.get("Content-Length") || 0);
+        if (contentLength > MAX_MAIN_OVERLAY_UPLOAD_BYTES) {
+          return json({ ok: false, error: "payload_too_large" }, 413);
+        }
+
+        const formData = await request.formData();
+        const file = formData.get("file");
+        if (!(file instanceof File)) {
+          return json({ ok: false, error: "file_required" }, 400);
+        }
+        if (file.size <= 0 || file.size > MAX_MAIN_OVERLAY_UPLOAD_BYTES) {
+          return json({ ok: false, error: "invalid_file_size" }, 400);
+        }
+
+        const contentType = sanitizeString(file.type || "", 120).toLowerCase();
+        if (!MAIN_OVERLAY_UPLOAD_TYPES.has(contentType)) {
+          return json({ ok: false, error: "unsupported_file_type" }, 400);
+        }
+
+        const baseName = sanitizeFileSegment(basenameWithoutExtension(file.name) || "main-overlay-asset") || "main-overlay-asset";
+        const extension = extname(file.name) || ".mp4";
+        const assetName = `${Date.now()}-${baseName}${extension}`;
+        const r2Key = buildZoneAssetR2Key(tenant, region, "main-overlay", assetName);
+        const publicUrl = buildZoneAssetPublicUrl(request, tenant, region, "main-overlay", assetName);
+        const arrayBuffer = await file.arrayBuffer();
+
+        await env.SCREENS_BUCKET.put(r2Key, arrayBuffer, {
+          httpMetadata: {
+            contentType
+          }
+        });
+
+        const nowIso = new Date().toISOString();
+        await env.DB.prepare(`
+          INSERT INTO region_assets
+          (tenant, region, zone, r2_key, public_url, filename_original, filename_display, content_type, size_bytes, status, created_by, created_at, updated_at)
+          VALUES (?, ?, 'main-overlay', ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        `).bind(
+          tenant,
+          region,
+          r2Key,
+          publicUrl,
+          sanitizeString(file.name, 240),
+          assetName,
+          contentType,
+          file.size,
+          normalizeUpdatedBy(formData.get("updatedBy"), "portal-admin"),
+          nowIso,
+          nowIso
+        ).run();
+
+        return json({
+          ok: true,
+          asset: {
+            tenant,
+            region,
+            zone: "main-overlay",
+            src: publicUrl,
+            public_url: publicUrl,
+            filename_original: sanitizeString(file.name, 240),
+            filename_display: assetName,
+            label: sanitizeString(file.name, 240),
+            content_type: contentType,
+            size_bytes: file.size,
+            type: "video",
+            source: "uploaded",
+            created_at: nowIso
+          }
+        });
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "main-overlay-assets" &&
+        request.method === "DELETE"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        if (!env.SCREENS_BUCKET) {
+          return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+        }
+
+        const asset = await readActiveRegionAssetById(env, tenant, region, "main-overlay", parts[6]);
+        if (!asset) {
+          return json({ ok: false, error: "asset_not_found" }, 404);
+        }
+
+        const currentPrimary = await readCurrentScopeState(env, buildPrimaryScope(tenant, region));
+        const referenced = mainOverlayReferencesAsset(currentPrimary.state, asset.public_url);
+        const cleanupReferences = url.searchParams.get("cleanup") === "references";
+
+        if (referenced && !cleanupReferences) {
+          return json({
+            ok: false,
+            error: "asset_in_use",
+            references: {
+              main_overlay: true
+            }
+          }, 409);
+        }
+
+        if (referenced && cleanupReferences) {
+          const cleaned = removeMainOverlayAssetReference(currentPrimary.state, asset.public_url);
+          await writePrimaryScopeState(
+            env,
+            tenant,
+            region,
+            cleaned.state,
+            "portal-admin",
+            now,
+            request
+          );
+        }
+
+        await env.SCREENS_BUCKET.delete(asset.r2_key);
+        await markRegionAssetDeleted(env, asset, "portal-admin");
+
+        return json({
+          ok: true,
+          deleted_asset_id: asset.asset_id,
+          zone: "main-overlay",
+          cleanup_applied: cleanupReferences && referenced,
+          references_removed: {
+            main_overlay: cleanupReferences && referenced
+          }
+        });
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 6 &&
+        parts[3] === "regions" &&
+        parts[5] === "trivia-overlay-assets" &&
+        request.method === "GET"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        return json(await buildOverlayAssetsResponse(env, request, tenant, region, "trivia-overlay"));
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "trivia-overlay-assets" &&
+        parts[6] === "upload" &&
+        request.method === "POST"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        if (!env.SCREENS_BUCKET) {
+          return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+        }
+        const contentLength = Number(request.headers.get("Content-Length") || 0);
+        if (contentLength > MAX_TRIVIA_OVERLAY_UPLOAD_BYTES) {
+          return json({ ok: false, error: "payload_too_large" }, 413);
+        }
+
+        const formData = await request.formData();
+        const file = formData.get("file");
+        if (!(file instanceof File)) {
+          return json({ ok: false, error: "file_required" }, 400);
+        }
+        if (file.size <= 0 || file.size > MAX_TRIVIA_OVERLAY_UPLOAD_BYTES) {
+          return json({ ok: false, error: "invalid_file_size" }, 400);
+        }
+
+        const contentType = sanitizeString(file.type || "", 120).toLowerCase();
+        if (!TRIVIA_OVERLAY_UPLOAD_TYPES.has(contentType)) {
+          return json({ ok: false, error: "unsupported_file_type" }, 400);
+        }
+
+        const baseName = sanitizeFileSegment(basenameWithoutExtension(file.name) || "trivia-overlay-asset") || "trivia-overlay-asset";
+        const extension = extname(file.name) || (contentType === "text/html" ? ".html" : ".png");
+        const assetName = `${Date.now()}-${baseName}${extension}`;
+        const r2Key = buildZoneAssetR2Key(tenant, region, "trivia-overlay", assetName);
+        const publicUrl = buildZoneAssetPublicUrl(request, tenant, region, "trivia-overlay", assetName);
+        const arrayBuffer = await file.arrayBuffer();
+
+        await env.SCREENS_BUCKET.put(r2Key, arrayBuffer, {
+          httpMetadata: {
+            contentType
+          }
+        });
+
+        const nowIso = new Date().toISOString();
+        await env.DB.prepare(`
+          INSERT INTO region_assets
+          (tenant, region, zone, r2_key, public_url, filename_original, filename_display, content_type, size_bytes, status, created_by, created_at, updated_at)
+          VALUES (?, ?, 'trivia-overlay', ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        `).bind(
+          tenant,
+          region,
+          r2Key,
+          publicUrl,
+          sanitizeString(file.name, 240),
+          assetName,
+          contentType,
+          file.size,
+          normalizeUpdatedBy(formData.get("updatedBy"), "portal-admin"),
+          nowIso,
+          nowIso
+        ).run();
+
+        return json({
+          ok: true,
+          asset: {
+            tenant,
+            region,
+            zone: "trivia-overlay",
+            src: publicUrl,
+            public_url: publicUrl,
+            filename_original: sanitizeString(file.name, 240),
+            filename_display: assetName,
+            label: sanitizeString(file.name, 240),
+            content_type: contentType,
+            size_bytes: file.size,
+            type: inferRegionAssetType(contentType, assetName),
+            source: "uploaded",
+            created_at: nowIso
+          }
+        });
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "trivia-overlay-assets" &&
+        request.method === "DELETE"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        if (!env.SCREENS_BUCKET) {
+          return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+        }
+
+        const asset = await readActiveRegionAssetById(env, tenant, region, "trivia-overlay", parts[6]);
+        if (!asset) {
+          return json({ ok: false, error: "asset_not_found" }, 404);
+        }
+
+        const currentPrimary = await readCurrentScopeState(env, buildPrimaryScope(tenant, region));
+        const referencedRows = listTriviaOverlayRowsReferencingSrc(currentPrimary.state, asset.public_url);
+        const cleanupReferences = url.searchParams.get("cleanup") === "references";
+
+        if (referencedRows.length && !cleanupReferences) {
+          return json({
+            ok: false,
+            error: "asset_in_use",
+            references: {
+              playlist_rows: referencedRows
+            }
+          }, 409);
+        }
+
+        if (referencedRows.length && cleanupReferences) {
+          const cleaned = removeTriviaOverlaySrcReferences(currentPrimary.state, asset.public_url);
+          await writePrimaryScopeState(
+            env,
+            tenant,
+            region,
+            cleaned.state,
+            "portal-admin",
+            now,
+            request
+          );
+        }
+
+        await env.SCREENS_BUCKET.delete(asset.r2_key);
+        await markRegionAssetDeleted(env, asset, "portal-admin");
+
+        return json({
+          ok: true,
+          deleted_asset_id: asset.asset_id,
+          zone: "trivia-overlay",
+          cleanup_applied: cleanupReferences && referencedRows.length > 0,
+          references_removed: {
+            playlist_rows: cleanupReferences ? referencedRows : []
           }
         });
       }
