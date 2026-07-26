@@ -235,6 +235,60 @@ function sanitizePositiveNumber(value, fallback, min = 1, max = Number.MAX_SAFE_
   return Math.min(max, Math.max(min, numeric));
 }
 
+function resolveOfflineThresholdMs(value, fallbackMs) {
+  const thresholdMinutes = Number(value);
+  if (!Number.isFinite(thresholdMinutes) || thresholdMinutes <= 0) {
+    return fallbackMs;
+  }
+  return thresholdMinutes * 60 * 1000;
+}
+
+function minutesForTimeString(value) {
+  const match = /^(\d{2}):(\d{2})$/.exec(String(value || "").trim());
+  if (!match) return null;
+  return (Number(match[1]) * 60) + Number(match[2]);
+}
+
+function timePartsInZone(date, timezone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone || "America/Chicago",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  return {
+    hour: Number(parts.find((part) => part.type === "hour")?.value || 0),
+    minute: Number(parts.find((part) => part.type === "minute")?.value || 0)
+  };
+}
+
+function isDayWindow(policy, date = new Date()) {
+  const startMinutes = minutesForTimeString(policy?.dayStartTime);
+  const endMinutes = minutesForTimeString(policy?.dayEndTime);
+  if (startMinutes === null || endMinutes === null) return true;
+
+  const current = timePartsInZone(date, policy?.timezone || "America/Chicago");
+  const currentMinutes = (current.hour * 60) + current.minute;
+  if (startMinutes === endMinutes) return true;
+  if (startMinutes < endMinutes) {
+    return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+  }
+  return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+}
+
+function resolvePolicyOfflineThresholdMs(policy, fallbackMs, date = new Date()) {
+  const legacyThresholdMinutes = Number(policy?.offlineThresholdMinutes);
+  const dayThresholdMinutes = policy?.dayOfflineThresholdMinutes === undefined
+    ? legacyThresholdMinutes
+    : Number(policy.dayOfflineThresholdMinutes);
+  const nightThresholdMinutes = policy?.nightOfflineThresholdMinutes === undefined
+    ? legacyThresholdMinutes
+    : Number(policy.nightOfflineThresholdMinutes);
+  const active = isDayWindow(policy, date);
+  const selectedMinutes = active ? dayThresholdMinutes : nightThresholdMinutes;
+  return resolveOfflineThresholdMs(selectedMinutes, fallbackMs);
+}
+
 function extname(value) {
   const candidate = String(value || "");
   const dotIndex = candidate.lastIndexOf(".");
@@ -776,6 +830,39 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function parseStoredJsonObject(value) {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = typeof value === "string" ? JSON.parse(value) : value;
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildStoredScopeSummary(scopeSummary, heartbeatTransport, now, doError = "") {
+  const next = isPlainObject(scopeSummary) ? cloneJson(scopeSummary) : {};
+  next.__heartbeat_meta = {
+    transport: heartbeatTransport === "d1-fallback" ? "d1-fallback" : "do",
+    updated_at: Number(now || 0) || Date.now(),
+    do_error: sanitizeString(doError || "", 200)
+  };
+  return next;
+}
+
+function extractHeartbeatTransport(item, fallback = "legacy-unknown") {
+  const meta = isPlainObject(item?.scope_summary?.__heartbeat_meta)
+    ? item.scope_summary.__heartbeat_meta
+    : null;
+  const transport = sanitizeString(meta?.transport || "", 40);
+  if (transport === "do" || transport === "d1-fallback") {
+    return transport;
+  }
+  return fallback;
+}
+
 function listPlaylistsReferencingSrc(playlists, src) {
   if (!isPlainObject(playlists) || !src) {
     return [];
@@ -1148,10 +1235,97 @@ function getTenantRegionStub(env, tenant, region) {
   return env.TENANT_REGION_DO.get(id);
 }
 
+async function fetchTenantRegionItemsFromD1(env, tenant, region, search = "") {
+  const params = new URLSearchParams(String(search || "").replace(/^\?/, ""));
+  const now = Date.now();
+  const requestedOfflineMs = Number(params.get("offline_ms") || 0);
+  const usesOverride = Number.isFinite(requestedOfflineMs) && requestedOfflineMs > 0;
+  const defaultOfflineMs = 1800000;
+
+  const rows = await env.DB.prepare(`
+    SELECT
+      tenant,
+      region,
+      device_id,
+      last_url,
+      last_app_version,
+      last_manifest_hash,
+      last_viewport,
+      last_visibility,
+      last_seen,
+      last_heartbeat_policy,
+      last_override_summary,
+      last_scope_summary
+    FROM devices
+    WHERE tenant = ? AND region = ?
+    ORDER BY last_seen DESC, device_id ASC
+  `).bind(tenant, region).all();
+
+  const items = (rows.results || []).map((row) => {
+    const heartbeatPolicy = parseStoredJsonObject(row.last_heartbeat_policy);
+    const overrideSummary = parseStoredJsonObject(row.last_override_summary) || {};
+    const scopeSummary = parseStoredJsonObject(row.last_scope_summary) || {};
+    const lastSeen = Number(row.last_seen || 0);
+    const effectiveOfflineMs = usesOverride
+      ? requestedOfflineMs
+      : resolvePolicyOfflineThresholdMs(heartbeatPolicy, defaultOfflineMs, new Date(now));
+
+    return {
+      device_id: normalizeDeviceId(row.device_id || ""),
+      tenant: sanitizeString(row.tenant || "", 64),
+      region: sanitizeString(row.region || "", 16),
+      url: sanitizeString(row.last_url || "", 500),
+      app_version: sanitizeString(row.last_app_version || "", 80),
+      last_seen: lastSeen,
+      visibility: sanitizeString(row.last_visibility || "", 40) || "visible",
+      status: (now - lastSeen) <= effectiveOfflineMs ? "online" : "offline",
+      effective_offline_ms: effectiveOfflineMs,
+      heartbeat_policy: heartbeatPolicy,
+      scope_summary: scopeSummary,
+      override_summary: overrideSummary,
+      heartbeat_transport: extractHeartbeatTransport({ scope_summary: scopeSummary }, "legacy-unknown"),
+      presence_source: "d1-fallback",
+      proof: {},
+      metrics: {}
+    };
+  });
+
+  return {
+    tenant,
+    region,
+    now,
+    offline_ms: usesOverride ? requestedOfflineMs : 0,
+    uses_device_policy: !usesOverride,
+    source: {
+      mode: "d1-fallback",
+      detail: "tenant-region durable object unavailable; served presence from D1"
+    },
+    total: items.length,
+    items
+  };
+}
+
 async function fetchTenantRegionItems(env, tenant, region, search = "") {
-  const stub = getTenantRegionStub(env, tenant, region);
-  const resp = await stub.fetch(`https://do/${tenant}/${region}/list${search}`);
-  const payload = await resp.json();
+  let payload;
+  try {
+    const stub = getTenantRegionStub(env, tenant, region);
+    const resp = await stub.fetch(`https://do/${tenant}/${region}/list${search}`);
+    if (!resp.ok) {
+      throw new Error(`tenant_region_do_list_failed:${resp.status}`);
+    }
+    payload = await resp.json();
+    payload = isPlainObject(payload) ? payload : {};
+    payload.source = {
+      mode: "do",
+      detail: "tenant-region durable object"
+    };
+  } catch {
+    if (!env.DB) {
+      throw new Error("region_unavailable");
+    }
+    payload = await fetchTenantRegionItemsFromD1(env, tenant, region, search);
+  }
+
   const items = Array.isArray(payload?.items) ? payload.items : [];
 
   if (env.DB && items.length) {
@@ -1188,11 +1362,21 @@ async function fetchTenantRegionItems(env, tenant, region, search = "") {
 
       return {
         ...item,
+        heartbeat_transport: sanitizeString(item?.heartbeat_transport || "", 40) || extractHeartbeatTransport({ scope_summary: nextScopeSummary }, "legacy-unknown"),
         override_summary: nextOverrideSummary,
         scope_summary: nextScopeSummary
       };
     });
   }
+
+  payload.items = (Array.isArray(payload.items) ? payload.items : []).map((item) => {
+    const scopeSummary = isPlainObject(item?.scope_summary) ? item.scope_summary : {};
+    return {
+      ...item,
+      heartbeat_transport: sanitizeString(item?.heartbeat_transport || "", 40) || extractHeartbeatTransport({ scope_summary: scopeSummary }, "legacy-unknown"),
+      presence_source: sanitizeString(item?.presence_source || "", 40) || sanitizeString(payload?.source?.mode || "", 40) || "do"
+    };
+  });
 
   return payload;
 }
@@ -2421,62 +2605,100 @@ export default {
         last_seen: now
       };
 
-      const stub = getTenantRegionStub(env, safeTenant, safeRegion);
-      await stub.fetch(`https://do/${safeTenant}/${safeRegion}/upsert`, {
-        method: "POST",
-        body: JSON.stringify(payload)
+      let heartbeatTransport = "do";
+      let doWriteOk = false;
+      let d1WriteOk = false;
+      let doError = "";
+      try {
+        const stub = getTenantRegionStub(env, safeTenant, safeRegion);
+        const doPayload = {
+          ...payload,
+          scope_summary: buildStoredScopeSummary(payload.scope_summary, "do", now)
+        };
+        const doResponse = await stub.fetch(`https://do/${safeTenant}/${safeRegion}/upsert`, {
+          method: "POST",
+          body: JSON.stringify(doPayload)
+        });
+        if (!doResponse.ok) {
+          throw new Error(`tenant_region_do_upsert_failed:${doResponse.status}`);
+        }
+        doWriteOk = true;
+      } catch (error) {
+        heartbeatTransport = "d1-fallback";
+        doError = sanitizeString(error?.message || "tenant_region_do_unavailable", 200);
+      }
+
+      const storedScopeSummary = buildStoredScopeSummary(payload.scope_summary, heartbeatTransport, now, doError);
+
+      try {
+        await env.DB.prepare(`
+          INSERT INTO heartbeat_events
+          (ts, tenant, region, device_id, url, app_version, manifest_hash, frame_hash, viewport, visibility, heartbeat_policy, override_summary, scope_summary)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          now,
+          safeTenant,
+          safeRegion,
+          safeDeviceId,
+          payload.url,
+          payload.app_version,
+          payload.manifest_hash,
+          payload.frame_hash,
+          payload.viewport,
+          payload.visibility,
+          JSON.stringify(payload.heartbeat_policy || null),
+          JSON.stringify(payload.override_summary || {}),
+          JSON.stringify(storedScopeSummary || {})
+        ).run();
+
+        await env.DB.prepare(`
+          INSERT INTO devices (tenant, region, device_id, first_seen, last_seen, last_url, last_app_version, last_manifest_hash, last_viewport, last_visibility, last_heartbeat_policy, last_override_summary, last_scope_summary)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(tenant, region, device_id) DO UPDATE SET
+            last_seen=excluded.last_seen,
+            last_url=excluded.last_url,
+            last_app_version=excluded.last_app_version,
+            last_manifest_hash=excluded.last_manifest_hash,
+            last_viewport=excluded.last_viewport,
+            last_visibility=excluded.last_visibility,
+            last_heartbeat_policy=excluded.last_heartbeat_policy,
+            last_override_summary=excluded.last_override_summary,
+            last_scope_summary=excluded.last_scope_summary
+        `).bind(
+          safeTenant,
+          safeRegion,
+          safeDeviceId,
+          now,
+          now,
+          payload.url,
+          payload.app_version,
+          payload.manifest_hash,
+          payload.viewport,
+          payload.visibility,
+          JSON.stringify(payload.heartbeat_policy || null),
+          JSON.stringify(payload.override_summary || {}),
+          JSON.stringify(storedScopeSummary || {})
+        ).run();
+        d1WriteOk = true;
+      } catch (error) {
+        if (!doWriteOk) {
+          return json({
+            ok: false,
+            error: "heartbeat_persist_failed",
+            do_error: doError || null,
+            d1_error: sanitizeString(error?.message || "d1_write_failed", 200)
+          }, 503);
+        }
+      }
+
+      return json({
+        ok: true,
+        ts: now,
+        heartbeat_transport: heartbeatTransport,
+        do_write_ok: doWriteOk,
+        d1_write_ok: d1WriteOk,
+        degraded: !doWriteOk
       });
-
-      await env.DB.prepare(`
-        INSERT INTO heartbeat_events
-        (ts, tenant, region, device_id, url, app_version, manifest_hash, frame_hash, viewport, visibility, heartbeat_policy, override_summary, scope_summary)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        now,
-        safeTenant,
-        safeRegion,
-        safeDeviceId,
-        payload.url,
-        payload.app_version,
-        payload.manifest_hash,
-        payload.frame_hash,
-        payload.viewport,
-        payload.visibility,
-        JSON.stringify(payload.heartbeat_policy || null),
-        JSON.stringify(payload.override_summary || {}),
-        JSON.stringify(payload.scope_summary || {})
-      ).run();
-
-      await env.DB.prepare(`
-        INSERT INTO devices (tenant, region, device_id, first_seen, last_seen, last_url, last_app_version, last_manifest_hash, last_viewport, last_visibility, last_heartbeat_policy, last_override_summary, last_scope_summary)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(tenant, region, device_id) DO UPDATE SET
-          last_seen=excluded.last_seen,
-          last_url=excluded.last_url,
-          last_app_version=excluded.last_app_version,
-          last_manifest_hash=excluded.last_manifest_hash,
-          last_viewport=excluded.last_viewport,
-          last_visibility=excluded.last_visibility,
-          last_heartbeat_policy=excluded.last_heartbeat_policy,
-          last_override_summary=excluded.last_override_summary,
-          last_scope_summary=excluded.last_scope_summary
-      `).bind(
-        safeTenant,
-        safeRegion,
-        safeDeviceId,
-        now,
-        now,
-        payload.url,
-        payload.app_version,
-        payload.manifest_hash,
-        payload.viewport,
-        payload.visibility,
-        JSON.stringify(payload.heartbeat_policy || null),
-        JSON.stringify(payload.override_summary || {}),
-        JSON.stringify(payload.scope_summary || {})
-      ).run();
-
-      return json({ ok: true, ts: now });
     }
 
     if (path === "/api/tenants" && request.method === "GET") {
@@ -2519,6 +2741,7 @@ export default {
             tenant,
             region,
             now: data.now || now,
+            source: isPlainObject(data.source) ? data.source : { mode: "do", detail: "tenant-region durable object" },
             offline_ms: offlineMs,
             uses_device_policy: Boolean(data.uses_device_policy),
             total: items.length,
