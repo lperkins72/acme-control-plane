@@ -120,6 +120,10 @@ function withCors(response) {
   });
 }
 
+function isMissingD1ColumnError(error) {
+  return /no such column|has no column named/i.test(String(error?.message || ""));
+}
+
 function assetResponse(body, contentType) {
   return new Response(body, {
     status: 200,
@@ -1241,25 +1245,57 @@ async function fetchTenantRegionItemsFromD1(env, tenant, region, search = "") {
   const requestedOfflineMs = Number(params.get("offline_ms") || 0);
   const usesOverride = Number.isFinite(requestedOfflineMs) && requestedOfflineMs > 0;
   const defaultOfflineMs = 1800000;
+  let rows;
+  let supportsBrowserColumns = true;
 
-  const rows = await env.DB.prepare(`
-    SELECT
-      tenant,
-      region,
-      device_id,
-      last_url,
-      last_app_version,
-      last_manifest_hash,
-      last_viewport,
-      last_visibility,
-      last_seen,
-      last_heartbeat_policy,
-      last_override_summary,
-      last_scope_summary
-    FROM devices
-    WHERE tenant = ? AND region = ?
-    ORDER BY last_seen DESC, device_id ASC
-  `).bind(tenant, region).all();
+  try {
+    rows = await env.DB.prepare(`
+      SELECT
+        tenant,
+        region,
+        device_id,
+        last_url,
+        last_app_version,
+        last_browser_name,
+        last_browser_version,
+        last_browser_platform,
+        last_browser_user_agent,
+        last_manifest_hash,
+        last_viewport,
+        last_visibility,
+        last_seen,
+        last_heartbeat_policy,
+        last_override_summary,
+        last_scope_summary
+      FROM devices
+      WHERE tenant = ? AND region = ?
+      ORDER BY last_seen DESC, device_id ASC
+    `).bind(tenant, region).all();
+  } catch (error) {
+    if (!isMissingD1ColumnError(error)) {
+      throw error;
+    }
+
+    supportsBrowserColumns = false;
+    rows = await env.DB.prepare(`
+      SELECT
+        tenant,
+        region,
+        device_id,
+        last_url,
+        last_app_version,
+        last_manifest_hash,
+        last_viewport,
+        last_visibility,
+        last_seen,
+        last_heartbeat_policy,
+        last_override_summary,
+        last_scope_summary
+      FROM devices
+      WHERE tenant = ? AND region = ?
+      ORDER BY last_seen DESC, device_id ASC
+    `).bind(tenant, region).all();
+  }
 
   const items = (rows.results || []).map((row) => {
     const heartbeatPolicy = parseStoredJsonObject(row.last_heartbeat_policy);
@@ -1276,6 +1312,10 @@ async function fetchTenantRegionItemsFromD1(env, tenant, region, search = "") {
       region: sanitizeString(row.region || "", 16),
       url: sanitizeString(row.last_url || "", 500),
       app_version: sanitizeString(row.last_app_version || "", 80),
+      browser_name: supportsBrowserColumns ? sanitizeString(row.last_browser_name || "", 80) : "",
+      browser_version: supportsBrowserColumns ? sanitizeString(row.last_browser_version || "", 40) : "",
+      browser_platform: supportsBrowserColumns ? sanitizeString(row.last_browser_platform || "", 80) : "",
+      browser_user_agent: supportsBrowserColumns ? sanitizeString(row.last_browser_user_agent || "", 500) : "",
       last_seen: lastSeen,
       visibility: sanitizeString(row.last_visibility || "", 40) || "visible",
       status: (now - lastSeen) <= effectiveOfflineMs ? "online" : "offline",
@@ -2593,6 +2633,10 @@ export default {
         device_id: safeDeviceId,
         url: sanitizeString(body.value.url || "", 500),
         app_version: sanitizeString(body.value.app_version || "", 80),
+        browser_name: sanitizeString(body.value.browser_name || "", 80),
+        browser_version: sanitizeString(body.value.browser_version || "", 40),
+        browser_platform: sanitizeString(body.value.browser_platform || "", 80),
+        browser_user_agent: sanitizeString(body.value.browser_user_agent || "", 500),
         manifest_hash: sanitizeString(body.value.manifest_hash || "", 120),
         frame_hash: sanitizeString(body.value.frame_hash || "", 120),
         viewport: sanitizeString(body.value.viewport || "", 40),
@@ -2631,54 +2675,121 @@ export default {
       const storedScopeSummary = buildStoredScopeSummary(payload.scope_summary, heartbeatTransport, now, doError);
 
       try {
-        await env.DB.prepare(`
-          INSERT INTO heartbeat_events
-          (ts, tenant, region, device_id, url, app_version, manifest_hash, frame_hash, viewport, visibility, heartbeat_policy, override_summary, scope_summary)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(
-          now,
-          safeTenant,
-          safeRegion,
-          safeDeviceId,
-          payload.url,
-          payload.app_version,
-          payload.manifest_hash,
-          payload.frame_hash,
-          payload.viewport,
-          payload.visibility,
-          JSON.stringify(payload.heartbeat_policy || null),
-          JSON.stringify(payload.override_summary || {}),
-          JSON.stringify(storedScopeSummary || {})
-        ).run();
+        try {
+          await env.DB.prepare(`
+            INSERT INTO heartbeat_events
+            (ts, tenant, region, device_id, url, app_version, browser_name, browser_version, browser_platform, browser_user_agent, manifest_hash, frame_hash, viewport, visibility, heartbeat_policy, override_summary, scope_summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            now,
+            safeTenant,
+            safeRegion,
+            safeDeviceId,
+            payload.url,
+            payload.app_version,
+            payload.browser_name,
+            payload.browser_version,
+            payload.browser_platform,
+            payload.browser_user_agent,
+            payload.manifest_hash,
+            payload.frame_hash,
+            payload.viewport,
+            payload.visibility,
+            JSON.stringify(payload.heartbeat_policy || null),
+            JSON.stringify(payload.override_summary || {}),
+            JSON.stringify(storedScopeSummary || {})
+          ).run();
 
-        await env.DB.prepare(`
-          INSERT INTO devices (tenant, region, device_id, first_seen, last_seen, last_url, last_app_version, last_manifest_hash, last_viewport, last_visibility, last_heartbeat_policy, last_override_summary, last_scope_summary)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(tenant, region, device_id) DO UPDATE SET
-            last_seen=excluded.last_seen,
-            last_url=excluded.last_url,
-            last_app_version=excluded.last_app_version,
-            last_manifest_hash=excluded.last_manifest_hash,
-            last_viewport=excluded.last_viewport,
-            last_visibility=excluded.last_visibility,
-            last_heartbeat_policy=excluded.last_heartbeat_policy,
-            last_override_summary=excluded.last_override_summary,
-            last_scope_summary=excluded.last_scope_summary
-        `).bind(
-          safeTenant,
-          safeRegion,
-          safeDeviceId,
-          now,
-          now,
-          payload.url,
-          payload.app_version,
-          payload.manifest_hash,
-          payload.viewport,
-          payload.visibility,
-          JSON.stringify(payload.heartbeat_policy || null),
-          JSON.stringify(payload.override_summary || {}),
-          JSON.stringify(storedScopeSummary || {})
-        ).run();
+          await env.DB.prepare(`
+            INSERT INTO devices (tenant, region, device_id, first_seen, last_seen, last_url, last_app_version, last_browser_name, last_browser_version, last_browser_platform, last_browser_user_agent, last_manifest_hash, last_viewport, last_visibility, last_heartbeat_policy, last_override_summary, last_scope_summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant, region, device_id) DO UPDATE SET
+              last_seen=excluded.last_seen,
+              last_url=excluded.last_url,
+              last_app_version=excluded.last_app_version,
+              last_browser_name=excluded.last_browser_name,
+              last_browser_version=excluded.last_browser_version,
+              last_browser_platform=excluded.last_browser_platform,
+              last_browser_user_agent=excluded.last_browser_user_agent,
+              last_manifest_hash=excluded.last_manifest_hash,
+              last_viewport=excluded.last_viewport,
+              last_visibility=excluded.last_visibility,
+              last_heartbeat_policy=excluded.last_heartbeat_policy,
+              last_override_summary=excluded.last_override_summary,
+              last_scope_summary=excluded.last_scope_summary
+          `).bind(
+            safeTenant,
+            safeRegion,
+            safeDeviceId,
+            now,
+            now,
+            payload.url,
+            payload.app_version,
+            payload.browser_name,
+            payload.browser_version,
+            payload.browser_platform,
+            payload.browser_user_agent,
+            payload.manifest_hash,
+            payload.viewport,
+            payload.visibility,
+            JSON.stringify(payload.heartbeat_policy || null),
+            JSON.stringify(payload.override_summary || {}),
+            JSON.stringify(storedScopeSummary || {})
+          ).run();
+        } catch (error) {
+          if (!isMissingD1ColumnError(error)) {
+            throw error;
+          }
+
+          await env.DB.prepare(`
+            INSERT INTO heartbeat_events
+            (ts, tenant, region, device_id, url, app_version, manifest_hash, frame_hash, viewport, visibility, heartbeat_policy, override_summary, scope_summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            now,
+            safeTenant,
+            safeRegion,
+            safeDeviceId,
+            payload.url,
+            payload.app_version,
+            payload.manifest_hash,
+            payload.frame_hash,
+            payload.viewport,
+            payload.visibility,
+            JSON.stringify(payload.heartbeat_policy || null),
+            JSON.stringify(payload.override_summary || {}),
+            JSON.stringify(storedScopeSummary || {})
+          ).run();
+
+          await env.DB.prepare(`
+            INSERT INTO devices (tenant, region, device_id, first_seen, last_seen, last_url, last_app_version, last_manifest_hash, last_viewport, last_visibility, last_heartbeat_policy, last_override_summary, last_scope_summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant, region, device_id) DO UPDATE SET
+              last_seen=excluded.last_seen,
+              last_url=excluded.last_url,
+              last_app_version=excluded.last_app_version,
+              last_manifest_hash=excluded.last_manifest_hash,
+              last_viewport=excluded.last_viewport,
+              last_visibility=excluded.last_visibility,
+              last_heartbeat_policy=excluded.last_heartbeat_policy,
+              last_override_summary=excluded.last_override_summary,
+              last_scope_summary=excluded.last_scope_summary
+          `).bind(
+            safeTenant,
+            safeRegion,
+            safeDeviceId,
+            now,
+            now,
+            payload.url,
+            payload.app_version,
+            payload.manifest_hash,
+            payload.viewport,
+            payload.visibility,
+            JSON.stringify(payload.heartbeat_policy || null),
+            JSON.stringify(payload.override_summary || {}),
+            JSON.stringify(storedScopeSummary || {})
+          ).run();
+        }
         d1WriteOk = true;
       } catch (error) {
         if (!doWriteOk) {
