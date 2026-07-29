@@ -1129,7 +1129,9 @@ async function buildPrimaryConfigResponse(env, request, tenant, region) {
   const effectivePlaylists = syncState?.playlists && typeof syncState.playlists === "object"
     ? normalizePrimaryPlaylists(syncState.playlists, manifest.defaultDurationSeconds)
     : buildDefaultPrimaryPlaylists(manifest);
-  effectivePlaylists.Default = defaultPlaylist;
+  if (!Array.isArray(effectivePlaylists.Default) || !effectivePlaylists.Default.length) {
+    effectivePlaylists.Default = defaultPlaylist;
+  }
   const activePlaylistName = effectivePlaylists[sanitizeString(syncState?.activePlaylistName, 80)]
     ? sanitizeString(syncState.activePlaylistName, 80)
     : (effectivePlaylists.Default ? "Default" : Object.keys(effectivePlaylists)[0] || "Default");
