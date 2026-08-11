@@ -4,7 +4,7 @@ import { SettingsScopeDO } from "./settings_scope_do.mjs";
 export { TenantRegionDO, SettingsScopeDO };
 
 const SERVICE_NAME = "acme-control-plane";
-const API_VERSION = "2026-07-10-tenant-v1";
+const API_VERSION = "2026-08-10-large-asset-uploads";
 const SCHEMA_VERSION = 1;
 const MAX_SETTINGS_BODY_BYTES = 128 * 1024;
 const MAX_HEARTBEAT_BODY_BYTES = 64 * 1024;
@@ -12,8 +12,12 @@ const MAX_PRIMARY_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_FOOTER_UPLOAD_BYTES = 12 * 1024 * 1024;
 const MAX_MAIN_OVERLAY_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_TRIVIA_OVERLAY_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_LARGE_VIDEO_UPLOAD_BYTES = 300 * 1024 * 1024;
+const MULTIPART_UPLOAD_PART_BYTES = 20 * 1024 * 1024;
+const MAX_MULTIPART_PART_BYTES = 24 * 1024 * 1024;
+const MAX_FORM_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
 const VALID_ZONES = new Set(["primary", "secondary", "trivia", "footer", "main-overlay", "trivia-overlay"]);
-const REGION_SCOPED_ZONES = new Set(["primary", "trivia", "footer", "main-overlay", "trivia-overlay"]);
+const REGION_SCOPED_ZONES = new Set(["primary", "secondary", "trivia", "footer", "main-overlay", "trivia-overlay"]);
 const DEVICE_SCOPED_ZONES = new Set(["primary", "secondary"]);
 const ALLOWED_OVERRIDE_MODES = new Set(["region-default", "device-override", "device-only"]);
 const MAIN_OVERLAY_INTERVALS = new Set([15, 30, 60]);
@@ -46,6 +50,46 @@ const FOOTER_UPLOAD_TYPES = new Set([
   "image/webp",
   "image/gif",
   "image/svg+xml"
+]);
+const VIDEO_UPLOAD_TYPES = new Set(["video/mp4", "video/webm", "video/ogg"]);
+const UPLOAD_ZONE_CONFIG = Object.freeze({
+  "primary-assets": {
+    zone: "primary",
+    defaultName: "primary-asset",
+    types: PRIMARY_UPLOAD_TYPES,
+    standardMaxBytes: MAX_PRIMARY_UPLOAD_BYTES
+  },
+  "footer-assets": {
+    zone: "footer",
+    defaultName: "footer-asset",
+    types: FOOTER_UPLOAD_TYPES,
+    standardMaxBytes: MAX_FOOTER_UPLOAD_BYTES
+  },
+  "main-overlay-assets": {
+    zone: "main-overlay",
+    defaultName: "main-overlay-asset",
+    types: MAIN_OVERLAY_UPLOAD_TYPES,
+    standardMaxBytes: MAX_MAIN_OVERLAY_UPLOAD_BYTES
+  },
+  "trivia-overlay-assets": {
+    zone: "trivia-overlay",
+    defaultName: "trivia-overlay-asset",
+    types: TRIVIA_OVERLAY_UPLOAD_TYPES,
+    standardMaxBytes: MAX_TRIVIA_OVERLAY_UPLOAD_BYTES
+  }
+});
+const CONTENT_TYPE_BY_EXTENSION = new Map([
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".png", "image/png"],
+  [".webp", "image/webp"],
+  [".gif", "image/gif"],
+  [".svg", "image/svg+xml"],
+  [".mp4", "video/mp4"],
+  [".webm", "video/webm"],
+  [".ogg", "video/ogg"],
+  [".html", "text/html"],
+  [".htm", "text/html"]
 ]);
 const TENANT_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const REGION_RE = /^reg(0[1-9]|[1-9]\d)$/;
@@ -167,7 +211,7 @@ function parseScope(scope) {
   const raw = String(scope || "").trim();
   if (!raw) return null;
 
-  const regionMatch = /^bdn:v1:tenant:([^:]+):region:(reg\d{2}):zone:(primary|trivia|footer)$/i.exec(raw);
+  const regionMatch = /^bdn:v1:tenant:([^:]+):region:(reg\d{2}):zone:(primary|secondary|trivia|footer|main-overlay|trivia-overlay)$/i.exec(raw);
   if (regionMatch) {
     const tenant = normalizeTenant(regionMatch[1]);
     const region = normalizeRegion(regionMatch[2]);
@@ -307,6 +351,41 @@ function basenameWithoutExtension(value) {
   return candidate.slice(0, dotIndex);
 }
 
+function resolveUploadContentType(filename, suppliedType) {
+  const normalized = sanitizeString(suppliedType || "", 120).toLowerCase();
+  return normalized || CONTENT_TYPE_BY_EXTENSION.get(extname(filename)) || "";
+}
+
+function uploadTypeIsAllowed(config, contentType) {
+  return config?.types instanceof Map
+    ? config.types.has(contentType)
+    : Boolean(config?.types?.has(contentType));
+}
+
+function maxUploadBytesForType(config, contentType) {
+  return VIDEO_UPLOAD_TYPES.has(contentType)
+    ? MAX_LARGE_VIDEO_UPLOAD_BYTES
+    : config.standardMaxBytes;
+}
+
+function buildUploadCapabilities() {
+  return {
+    multipart_part_bytes: MULTIPART_UPLOAD_PART_BYTES,
+    max_video_bytes: MAX_LARGE_VIDEO_UPLOAD_BYTES,
+    zones: Object.fromEntries(Object.entries(UPLOAD_ZONE_CONFIG).map(([segment, config]) => {
+      const contentTypes = config.types instanceof Map ? [...config.types.keys()] : [...config.types];
+      return [config.zone, {
+        api_segment: segment,
+        content_types: contentTypes,
+        standard_max_bytes: config.standardMaxBytes,
+        video_max_bytes: contentTypes.some((type) => VIDEO_UPLOAD_TYPES.has(type))
+          ? MAX_LARGE_VIDEO_UPLOAD_BYTES
+          : null
+      }];
+    }))
+  };
+}
+
 function guessPrimaryTypeFromSrc(src) {
   return /\.mp4(?:$|\?)/i.test(String(src || "")) ? "video" : "image";
 }
@@ -342,6 +421,51 @@ function buildPrimaryAssetPublicUrl(request, tenant, region, assetName) {
 
 function buildPrimaryAssetR2Key(tenant, region, assetName) {
   return buildZoneAssetR2Key(tenant, region, "primary", assetName);
+}
+
+function buildUploadedAssetPayload({ tenant, region, zone, publicUrl, filenameOriginal, assetName, contentType, sizeBytes, createdAt }) {
+  const type = inferRegionAssetType(contentType, assetName);
+  return {
+    tenant,
+    region,
+    zone,
+    path: publicUrl,
+    src: publicUrl,
+    public_url: publicUrl,
+    filename_original: filenameOriginal,
+    filename_display: assetName,
+    label: filenameOriginal,
+    content_type: contentType,
+    size_bytes: sizeBytes,
+    type,
+    status: "active",
+    source: zone === "footer" ? "upload" : "uploaded",
+    created_at: createdAt
+  };
+}
+
+async function registerUploadedRegionAsset(env, details) {
+  const nowIso = new Date().toISOString();
+  await env.DB.prepare(`
+    INSERT INTO region_assets
+    (tenant, region, zone, r2_key, public_url, filename_original, filename_display, content_type, size_bytes, status, created_by, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+  `).bind(
+    details.tenant,
+    details.region,
+    details.zone,
+    details.r2Key,
+    details.publicUrl,
+    details.filenameOriginal,
+    details.assetName,
+    details.contentType,
+    details.sizeBytes,
+    details.updatedBy,
+    nowIso,
+    nowIso
+  ).run();
+
+  return buildUploadedAssetPayload({ ...details, createdAt: nowIso });
 }
 
 function buildFooterAssetPublicUrl(request, tenant, region, assetName) {
@@ -1231,6 +1355,147 @@ async function buildOverlayAssetsResponse(env, request, tenant, region, zone) {
   };
 }
 
+async function handleMultipartAssetUpload(request, env, requestUrl, tenant, region, segment) {
+  if (!isOriginAllowed(request, env)) {
+    return json({ ok: false, error: "origin_not_allowed" }, 403);
+  }
+  if (!env.DB) {
+    return json({ ok: false, error: "db_unavailable" }, 503);
+  }
+  if (!env.SCREENS_BUCKET) {
+    return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+  }
+
+  const config = UPLOAD_ZONE_CONFIG[segment];
+  if (!config) {
+    return json({ ok: false, error: "invalid_upload_zone" }, 404);
+  }
+
+  const action = sanitizeString(requestUrl.searchParams.get("action"), 20).toLowerCase();
+  if (action === "create" && request.method === "POST") {
+    const body = await readJsonBody(request, MAX_SETTINGS_BODY_BYTES);
+    if (!body.ok) return json({ ok: false, error: body.error }, 400);
+
+    const filenameOriginal = sanitizeString(body.value.filename, 240);
+    const contentType = resolveUploadContentType(filenameOriginal, body.value.contentType);
+    const sizeBytes = Math.floor(Number(body.value.sizeBytes));
+    if (!filenameOriginal) {
+      return json({ ok: false, error: "filename_required" }, 400);
+    }
+    if (!uploadTypeIsAllowed(config, contentType)) {
+      return json({ ok: false, error: "unsupported_file_type" }, 400);
+    }
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes > maxUploadBytesForType(config, contentType)) {
+      return json({ ok: false, error: "invalid_file_size" }, 400);
+    }
+
+    const baseName = sanitizeFileSegment(basenameWithoutExtension(filenameOriginal) || config.defaultName) || config.defaultName;
+    const extension = extname(filenameOriginal) || (VIDEO_UPLOAD_TYPES.has(contentType) ? ".mp4" : ".bin");
+    const uniqueSuffix = crypto.randomUUID().slice(0, 8);
+    const assetName = `${Date.now()}-${uniqueSuffix}-${baseName}${extension}`;
+    const r2Key = buildZoneAssetR2Key(tenant, region, config.zone, assetName);
+    const publicUrl = buildZoneAssetPublicUrl(request, tenant, region, config.zone, assetName);
+    const multipartUpload = await env.SCREENS_BUCKET.createMultipartUpload(r2Key, {
+      httpMetadata: { contentType }
+    });
+
+    return json({
+      ok: true,
+      upload: {
+        upload_id: multipartUpload.uploadId,
+        asset_name: assetName,
+        public_url: publicUrl,
+        part_size_bytes: MULTIPART_UPLOAD_PART_BYTES,
+        max_size_bytes: maxUploadBytesForType(config, contentType)
+      }
+    });
+  }
+
+  const rawAssetName = requestUrl.searchParams.get("assetName") || "";
+  const assetName = sanitizeFileSegment(rawAssetName);
+  const uploadId = sanitizeString(requestUrl.searchParams.get("uploadId"), 1024);
+  if (!assetName || assetName !== rawAssetName || !uploadId) {
+    return json({ ok: false, error: "invalid_multipart_upload" }, 400);
+  }
+  const r2Key = buildZoneAssetR2Key(tenant, region, config.zone, assetName);
+  const multipartUpload = env.SCREENS_BUCKET.resumeMultipartUpload(r2Key, uploadId);
+
+  if (action === "part" && request.method === "PUT") {
+    const partNumber = Number(requestUrl.searchParams.get("partNumber"));
+    const contentLength = Number(request.headers.get("Content-Length") || 0);
+    if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000) {
+      return json({ ok: false, error: "invalid_part_number" }, 400);
+    }
+    if (!request.body || !Number.isFinite(contentLength) || contentLength > MAX_MULTIPART_PART_BYTES) {
+      return json({ ok: false, error: "invalid_part_size" }, 400);
+    }
+
+    const uploadedPart = await multipartUpload.uploadPart(partNumber, request.body);
+    return json({ ok: true, part: { partNumber: uploadedPart.partNumber, etag: uploadedPart.etag } });
+  }
+
+  if (action === "abort" && request.method === "POST") {
+    await multipartUpload.abort();
+    return json({ ok: true, aborted: true });
+  }
+
+  if (action === "complete" && request.method === "POST") {
+    const body = await readJsonBody(request, MAX_SETTINGS_BODY_BYTES);
+    if (!body.ok) return json({ ok: false, error: body.error }, 400);
+
+    const filenameOriginal = sanitizeString(body.value.filename, 240);
+    const contentType = resolveUploadContentType(filenameOriginal, body.value.contentType);
+    const sizeBytes = Math.floor(Number(body.value.sizeBytes));
+    if (!filenameOriginal || !uploadTypeIsAllowed(config, contentType)) {
+      return json({ ok: false, error: "unsupported_file_type" }, 400);
+    }
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes > maxUploadBytesForType(config, contentType)) {
+      return json({ ok: false, error: "invalid_file_size" }, 400);
+    }
+
+    const completedParts = Array.isArray(body.value.parts)
+      ? body.value.parts.map((part) => ({
+          partNumber: Number(part?.partNumber),
+          etag: sanitizeString(part?.etag, 240)
+        })).filter((part) => Number.isInteger(part.partNumber) && part.partNumber > 0 && part.partNumber <= 10000 && part.etag)
+      : [];
+    completedParts.sort((left, right) => left.partNumber - right.partNumber);
+    if (!completedParts.length || new Set(completedParts.map((part) => part.partNumber)).size !== completedParts.length) {
+      return json({ ok: false, error: "invalid_completed_parts" }, 400);
+    }
+
+    const completedObject = await multipartUpload.complete(completedParts);
+    if (Number(completedObject.size) !== sizeBytes) {
+      await env.SCREENS_BUCKET.delete(r2Key);
+      return json({ ok: false, error: "completed_size_mismatch" }, 409);
+    }
+
+    const publicUrl = buildZoneAssetPublicUrl(request, tenant, region, config.zone, assetName);
+    let asset;
+    try {
+      asset = await registerUploadedRegionAsset(env, {
+        tenant,
+        region,
+        zone: config.zone,
+        r2Key,
+        publicUrl,
+        filenameOriginal,
+        assetName,
+        contentType,
+        sizeBytes,
+        updatedBy: normalizeUpdatedBy(body.value.updatedBy, "portal-admin")
+      });
+    } catch (error) {
+      await env.SCREENS_BUCKET.delete(r2Key);
+      throw error;
+    }
+
+    return json({ ok: true, asset });
+  }
+
+  return json({ ok: false, error: "unsupported_multipart_action" }, 405);
+}
+
 async function writePrimaryScopeState(env, tenant, region, stateValue, updatedBy, now, request) {
   const scopeMeta = parseScope(buildPrimaryScope(tenant, region));
   return writeScopeStateFromMeta(env, scopeMeta, stateValue, updatedBy, now, request);
@@ -1650,6 +1915,31 @@ export default {
         region &&
         parts.length === 6 &&
         parts[3] === "regions" &&
+        parts[5] === "asset-upload-capabilities" &&
+        request.method === "GET"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        return json({ ok: true, tenant, region, upload: buildUploadCapabilities() });
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        UPLOAD_ZONE_CONFIG[parts[5]] &&
+        parts[6] === "upload-multipart"
+      ) {
+        return handleMultipartAssetUpload(request, env, url, tenant, region, parts[5]);
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 6 &&
+        parts[3] === "regions" &&
         parts[5] === "footer-assets" &&
         request.method === "GET"
       ) {
@@ -1681,7 +1971,7 @@ export default {
           return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
         }
         const contentLength = Number(request.headers.get("Content-Length") || 0);
-        if (contentLength > MAX_FOOTER_UPLOAD_BYTES) {
+        if (contentLength > MAX_FOOTER_UPLOAD_BYTES + MAX_FORM_UPLOAD_OVERHEAD_BYTES) {
           return json({ ok: false, error: "payload_too_large" }, 413);
         }
 
@@ -1694,7 +1984,7 @@ export default {
           return json({ ok: false, error: "invalid_file_size" }, 400);
         }
 
-        const contentType = sanitizeString(file.type || "", 120).toLowerCase();
+        const contentType = resolveUploadContentType(file.name, file.type);
         if (!FOOTER_UPLOAD_TYPES.has(contentType)) {
           return json({ ok: false, error: "unsupported_file_type" }, 400);
         }
@@ -1852,7 +2142,7 @@ export default {
           return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
         }
         const contentLength = Number(request.headers.get("Content-Length") || 0);
-        if (contentLength > MAX_MAIN_OVERLAY_UPLOAD_BYTES) {
+        if (contentLength > MAX_MAIN_OVERLAY_UPLOAD_BYTES + MAX_FORM_UPLOAD_OVERHEAD_BYTES) {
           return json({ ok: false, error: "payload_too_large" }, 413);
         }
 
@@ -1865,7 +2155,7 @@ export default {
           return json({ ok: false, error: "invalid_file_size" }, 400);
         }
 
-        const contentType = sanitizeString(file.type || "", 120).toLowerCase();
+        const contentType = resolveUploadContentType(file.name, file.type);
         if (!MAIN_OVERLAY_UPLOAD_TYPES.has(contentType)) {
           return json({ ok: false, error: "unsupported_file_type" }, 400);
         }
@@ -2022,7 +2312,7 @@ export default {
           return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
         }
         const contentLength = Number(request.headers.get("Content-Length") || 0);
-        if (contentLength > MAX_TRIVIA_OVERLAY_UPLOAD_BYTES) {
+        if (contentLength > MAX_TRIVIA_OVERLAY_UPLOAD_BYTES + MAX_FORM_UPLOAD_OVERHEAD_BYTES) {
           return json({ ok: false, error: "payload_too_large" }, 413);
         }
 
@@ -2035,7 +2325,7 @@ export default {
           return json({ ok: false, error: "invalid_file_size" }, 400);
         }
 
-        const contentType = sanitizeString(file.type || "", 120).toLowerCase();
+        const contentType = resolveUploadContentType(file.name, file.type);
         if (!TRIVIA_OVERLAY_UPLOAD_TYPES.has(contentType)) {
           return json({ ok: false, error: "unsupported_file_type" }, 400);
         }
@@ -2225,7 +2515,7 @@ export default {
           return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
         }
         const contentLength = Number(request.headers.get("Content-Length") || 0);
-        if (contentLength > MAX_PRIMARY_UPLOAD_BYTES) {
+        if (contentLength > MAX_PRIMARY_UPLOAD_BYTES + MAX_FORM_UPLOAD_OVERHEAD_BYTES) {
           return json({ ok: false, error: "payload_too_large" }, 413);
         }
 
@@ -2238,7 +2528,7 @@ export default {
           return json({ ok: false, error: "invalid_file_size" }, 400);
         }
 
-        const contentType = sanitizeString(file.type || "", 120).toLowerCase();
+        const contentType = resolveUploadContentType(file.name, file.type);
         const primaryType = PRIMARY_UPLOAD_TYPES.get(contentType);
         if (!primaryType) {
           return json({ ok: false, error: "unsupported_file_type" }, 400);

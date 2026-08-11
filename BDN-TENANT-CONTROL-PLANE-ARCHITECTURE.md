@@ -57,10 +57,11 @@ Example:
 Region-scoped zones:
 
 - `bdn:v1:tenant:acme:region:reg01:zone:primary`
+- `bdn:v1:tenant:acme:region:reg01:zone:secondary`
 - `bdn:v1:tenant:acme:region:reg01:zone:trivia`
 - `bdn:v1:tenant:acme:region:reg01:zone:footer`
 
-Device-scoped zone:
+Legacy device-scoped weather remains accepted during migration:
 
 - `bdn:v1:tenant:acme:device:reg01:nuc-001:zone:secondary`
 
@@ -140,10 +141,11 @@ Other fields remain aligned with the demo control plane:
 Region zones remain region-default:
 
 - `primary`
+- `secondary`
 - `trivia`
 - `footer`
 
-Secondary remains device-scoped:
+Legacy secondary scopes remain readable and writable during the canary migration:
 
 - `secondary`
 
@@ -189,4 +191,3 @@ Migration, if ever needed later, should be explicit and one-way.
 - customer self-service
 - GitHub/Cloudflare automation
 - cross-tenant dashboards with auth
-
