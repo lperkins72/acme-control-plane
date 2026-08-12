@@ -1062,6 +1062,34 @@ function parsePrimaryStateJson(value, manifest) {
   return normalizePrimaryState(parsed, manifest);
 }
 
+function updateActivePrimaryPlaylistAsset(state, action, asset) {
+  const nextState = cloneJson(state);
+  const playlistName = nextState.playlists[nextState.activePlaylistName]
+    ? nextState.activePlaylistName
+    : Object.keys(nextState.playlists)[0];
+  if (!playlistName) {
+    return { state: nextState, changed: false, playlist: "" };
+  }
+
+  const list = Array.isArray(nextState.playlists[playlistName])
+    ? nextState.playlists[playlistName]
+    : [];
+  if (action === "append-active-all") {
+    if (list.some((item) => sanitizeString(item?.src, 500) === asset.src)) {
+      return { state: nextState, changed: false, playlist: playlistName };
+    }
+    nextState.playlists[playlistName] = [...list, asset];
+    return { state: nextState, changed: true, playlist: playlistName };
+  }
+
+  const filtered = list.filter((item) => sanitizeString(item?.src, 500) !== asset.src);
+  const changed = filtered.length !== list.length;
+  if (changed) {
+    nextState.playlists[playlistName] = filtered;
+  }
+  return { state: nextState, changed, playlist: playlistName };
+}
+
 function listFooterOverlaysReferencingPath(state, path) {
   const overlays = Array.isArray(state?.overlays) ? state.overlays : [];
   const matches = [];
@@ -2515,7 +2543,7 @@ export default {
         const body = await readJsonBody(request, MAX_SETTINGS_BODY_BYTES);
         if (!body.ok) return json({ ok: false, error: body.error }, 400);
         const action = sanitizeString(body.value.action, 40).toLowerCase();
-        if (action !== "append-pinned" && action !== "remove-all") {
+        if (action !== "append-active-all" && action !== "remove-active-all") {
           return json({ ok: false, error: "invalid_bulk_action" }, 400);
         }
 
@@ -2563,27 +2591,10 @@ export default {
             results.push({ device_id: deviceId, ok: false, error: normalized.error });
             continue;
           }
-          const nextState = cloneJson(normalized.value);
-          let changed = false;
-          let affectedPlaylists = [];
-
-          if (action === "append-pinned") {
-            const playlistName = nextState.playlists[nextState.activePlaylistName]
-              ? nextState.activePlaylistName
-              : Object.keys(nextState.playlists)[0];
-            const list = nextState.playlists[playlistName] || [];
-            if (!list.some((item) => sanitizeString(item?.src, 500) === src)) {
-              list.push({ src, type, durationSeconds });
-              nextState.playlists[playlistName] = list;
-              affectedPlaylists = [playlistName];
-              changed = true;
-            }
-          } else {
-            const cleaned = removeSrcFromPlaylists(nextState.playlists, src);
-            nextState.playlists = cleaned.playlists;
-            affectedPlaylists = cleaned.cleaned_playlists;
-            changed = affectedPlaylists.length > 0;
-          }
+          const update = updateActivePrimaryPlaylistAsset(normalized.value, action, { src, type, durationSeconds });
+          const nextState = update.state;
+          const changed = update.changed;
+          const affectedPlaylists = changed && update.playlist ? [update.playlist] : [];
 
           if (changed) {
             try {
@@ -2601,24 +2612,31 @@ export default {
           results.push({ device_id: deviceId, ok: true, changed, playlists: affectedPlaylists });
         }
 
-        let regionResult = null;
-        if (action === "remove-all") {
-          const regionScopeMeta = parseScope(buildPrimaryScope(tenant, region));
-          const currentRegionState = await readCurrentScopeState(env, regionScopeMeta.scope);
-          const baseRegionState = currentRegionState.state
-            ? parsePrimaryStateJson(currentRegionState.state, manifest)
-            : { ok: true, value: buildPrimaryStateFromConfig(primaryConfig) };
-          if (!baseRegionState.ok) {
-            regionResult = { ok: false, changed: false, error: baseRegionState.error };
-          } else {
-            const nextRegionState = cloneJson(baseRegionState.value);
-            const cleaned = removeSrcFromPlaylists(nextRegionState.playlists, src);
-            nextRegionState.playlists = cleaned.playlists;
-            const changed = cleaned.cleaned_playlists.length > 0;
-            if (changed) {
-              await writeScopeStateFromMeta(env, regionScopeMeta, nextRegionState, updatedBy, now, request);
+        const regionScopeMeta = parseScope(buildPrimaryScope(tenant, region));
+        const currentRegionState = await readCurrentScopeState(env, regionScopeMeta.scope);
+        const baseRegionState = currentRegionState.state
+          ? parsePrimaryStateJson(currentRegionState.state, manifest)
+          : { ok: true, value: buildPrimaryStateFromConfig(primaryConfig) };
+        let regionResult;
+        if (!baseRegionState.ok) {
+          regionResult = { ok: false, changed: false, error: baseRegionState.error };
+        } else {
+          const update = updateActivePrimaryPlaylistAsset(baseRegionState.value, action, { src, type, durationSeconds });
+          try {
+            if (update.changed) {
+              await writeScopeStateFromMeta(env, regionScopeMeta, update.state, updatedBy, now, request);
             }
-            regionResult = { ok: true, changed, playlists: cleaned.cleaned_playlists };
+            regionResult = {
+              ok: true,
+              changed: update.changed,
+              playlists: update.changed && update.playlist ? [update.playlist] : []
+            };
+          } catch (error) {
+            regionResult = {
+              ok: false,
+              changed: false,
+              error: sanitizeString(error?.message || "region_write_failed", 200)
+            };
           }
         }
 
