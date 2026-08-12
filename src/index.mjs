@@ -4,7 +4,7 @@ import { SettingsScopeDO } from "./settings_scope_do.mjs";
 export { TenantRegionDO, SettingsScopeDO };
 
 const SERVICE_NAME = "acme-control-plane";
-const API_VERSION = "2026-08-10-large-asset-uploads";
+const API_VERSION = "2026-08-11-primary-bulk-playlists";
 const SCHEMA_VERSION = 1;
 const MAX_SETTINGS_BODY_BYTES = 128 * 1024;
 const MAX_HEARTBEAT_BODY_BYTES = 64 * 1024;
@@ -1027,6 +1027,39 @@ function removeSrcFromPlaylists(playlists, src) {
     playlists: nextPlaylists,
     cleaned_playlists: cleanedPlaylists
   };
+}
+
+function buildPrimaryStateFromConfig(config) {
+  const manifest = isPlainObject(config?.manifest) ? config.manifest : { defaultDurationSeconds: 5 };
+  const syncState = isPlainObject(config?.sync_state) ? config.sync_state : {};
+  const playlists = normalizePrimaryPlaylists(config?.effective_playlists, manifest.defaultDurationSeconds || 5);
+  const activePlaylistName = playlists[sanitizeString(config?.effective_playlist_name, 80)]
+    ? sanitizeString(config.effective_playlist_name, 80)
+    : Object.keys(playlists)[0] || "Default";
+
+  return {
+    playlists: Object.keys(playlists).length ? playlists : { Default: [] },
+    activePlaylistName,
+    dissolveEnabled: Boolean(syncState.dissolveEnabled),
+    dissolveDuration: sanitizePositiveNumber(syncState.dissolveDuration, 0.8, 0.2, 10),
+    sponsorVideo: normalizeMainSponsorPath(syncState.sponsorVideo),
+    sponsorInterval: sanitizeMainSponsorInterval(syncState.sponsorInterval),
+    overlayEnabled: Boolean(syncState.overlayEnabled),
+    overlayPlaylist: Array.isArray(syncState.overlayPlaylist)
+      ? syncState.overlayPlaylist.map(sanitizeTriviaOverlayItem).filter(Boolean)
+      : [],
+    overlayStartEpoch: Math.max(0, Math.floor(Number(syncState.overlayStartEpoch) || 0))
+  };
+}
+
+function parsePrimaryStateJson(value, manifest) {
+  let parsed;
+  try {
+    parsed = typeof value === "string" ? JSON.parse(value) : value;
+  } catch {
+    return { ok: false, error: "invalid_stored_primary_state" };
+  }
+  return normalizePrimaryState(parsed, manifest);
 }
 
 function listFooterOverlaysReferencingPath(state, path) {
@@ -2461,6 +2494,154 @@ export default {
           return json({ ok: false, error: "db_unavailable" }, 503);
         }
         return json(await buildPrimaryConfigResponse(env, request, tenant, region));
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "primary-playlists" &&
+        parts[6] === "bulk-asset" &&
+        request.method === "POST"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+
+        const body = await readJsonBody(request, MAX_SETTINGS_BODY_BYTES);
+        if (!body.ok) return json({ ok: false, error: body.error }, 400);
+        const action = sanitizeString(body.value.action, 40).toLowerCase();
+        if (action !== "append-pinned" && action !== "remove-all") {
+          return json({ ok: false, error: "invalid_bulk_action" }, 400);
+        }
+
+        const src = sanitizeString(body.value.src, 500);
+        const type = sanitizeString(body.value.type || guessPrimaryTypeFromSrc(src), 20).toLowerCase() === "video" ? "video" : "image";
+        const durationSeconds = sanitizePositiveNumber(body.value.durationSeconds, 5, 1, 300);
+        if (!src) {
+          return json({ ok: false, error: "asset_src_required" }, 400);
+        }
+
+        const activeAsset = await env.DB.prepare(`
+          SELECT asset_id
+          FROM region_assets
+          WHERE tenant = ? AND region = ? AND zone = 'primary' AND public_url = ? AND status = 'active'
+          LIMIT 1
+        `).bind(tenant, region, src).first();
+        const primaryConfig = await buildPrimaryConfigResponse(env, request, tenant, region);
+        const libraryContainsSrc = Array.isArray(primaryConfig.asset_library) && primaryConfig.asset_library.some((item) =>
+          sanitizeString(item?.public_url || item?.src, 500) === src
+        );
+        if (!activeAsset && !libraryContainsSrc) {
+          return json({ ok: false, error: "primary_asset_not_found" }, 404);
+        }
+
+        const manifest = primaryConfig.manifest;
+        const updatedBy = normalizeUpdatedBy(body.value.updatedBy || body.value.updated_by, "portal-admin");
+        const pinnedRows = await env.DB.prepare(`
+          SELECT scope, device_id, state_json
+          FROM settings_current
+          WHERE tenant = ? AND region = ? AND zone = 'primary' AND scope_type = 'device'
+          ORDER BY device_id ASC
+        `).bind(tenant, region).all();
+        const results = [];
+
+        for (const row of (pinnedRows.results || [])) {
+          const deviceId = normalizeDeviceId(row.device_id || "");
+          const scopeMeta = parseScope(row.scope || buildPrimaryDeviceScope(tenant, region, deviceId));
+          if (!deviceId || !scopeMeta) {
+            results.push({ device_id: deviceId || "unknown", ok: false, error: "invalid_device_scope" });
+            continue;
+          }
+
+          const normalized = parsePrimaryStateJson(row.state_json, manifest);
+          if (!normalized.ok) {
+            results.push({ device_id: deviceId, ok: false, error: normalized.error });
+            continue;
+          }
+          const nextState = cloneJson(normalized.value);
+          let changed = false;
+          let affectedPlaylists = [];
+
+          if (action === "append-pinned") {
+            const playlistName = nextState.playlists[nextState.activePlaylistName]
+              ? nextState.activePlaylistName
+              : Object.keys(nextState.playlists)[0];
+            const list = nextState.playlists[playlistName] || [];
+            if (!list.some((item) => sanitizeString(item?.src, 500) === src)) {
+              list.push({ src, type, durationSeconds });
+              nextState.playlists[playlistName] = list;
+              affectedPlaylists = [playlistName];
+              changed = true;
+            }
+          } else {
+            const cleaned = removeSrcFromPlaylists(nextState.playlists, src);
+            nextState.playlists = cleaned.playlists;
+            affectedPlaylists = cleaned.cleaned_playlists;
+            changed = affectedPlaylists.length > 0;
+          }
+
+          if (changed) {
+            try {
+              await writeScopeStateFromMeta(env, scopeMeta, nextState, updatedBy, now, request);
+            } catch (error) {
+              results.push({
+                device_id: deviceId,
+                ok: false,
+                changed: false,
+                error: sanitizeString(error?.message || "device_write_failed", 200)
+              });
+              continue;
+            }
+          }
+          results.push({ device_id: deviceId, ok: true, changed, playlists: affectedPlaylists });
+        }
+
+        let regionResult = null;
+        if (action === "remove-all") {
+          const regionScopeMeta = parseScope(buildPrimaryScope(tenant, region));
+          const currentRegionState = await readCurrentScopeState(env, regionScopeMeta.scope);
+          const baseRegionState = currentRegionState.state
+            ? parsePrimaryStateJson(currentRegionState.state, manifest)
+            : { ok: true, value: buildPrimaryStateFromConfig(primaryConfig) };
+          if (!baseRegionState.ok) {
+            regionResult = { ok: false, changed: false, error: baseRegionState.error };
+          } else {
+            const nextRegionState = cloneJson(baseRegionState.value);
+            const cleaned = removeSrcFromPlaylists(nextRegionState.playlists, src);
+            nextRegionState.playlists = cleaned.playlists;
+            const changed = cleaned.cleaned_playlists.length > 0;
+            if (changed) {
+              await writeScopeStateFromMeta(env, regionScopeMeta, nextRegionState, updatedBy, now, request);
+            }
+            regionResult = { ok: true, changed, playlists: cleaned.cleaned_playlists };
+          }
+        }
+
+        const succeeded = results.filter((item) => item.ok).length;
+        const changed = results.filter((item) => item.ok && item.changed).length;
+        const failed = results.filter((item) => !item.ok).length;
+        return json({
+          ok: failed === 0 && regionResult?.ok !== false,
+          action,
+          tenant,
+          region,
+          asset: { src, type, durationSeconds },
+          summary: {
+            pinned_total: results.length,
+            pinned_succeeded: succeeded,
+            pinned_changed: changed,
+            pinned_skipped: succeeded - changed,
+            pinned_failed: failed,
+            region_changed: Boolean(regionResult?.changed)
+          },
+          region_result: regionResult,
+          device_results: results
+        }, failed || regionResult?.ok === false ? 207 : 200);
       }
 
       if (
