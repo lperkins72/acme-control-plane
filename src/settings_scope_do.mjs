@@ -2,7 +2,6 @@ export class SettingsScopeDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.sessions = new Set();
     this.currentState = null;
     this.currentMeta = null;
     this.revision = 0;
@@ -95,11 +94,11 @@ export class SettingsScopeDO {
       revision: this.revision
     });
 
-    for (const socket of this.sessions) {
+    for (const socket of this.state.getWebSockets()) {
       try {
         socket.send(payload);
       } catch {
-        this.sessions.delete(socket);
+        // A closing or failed socket must not prevent delivery to other clients.
       }
     }
   }
@@ -113,16 +112,7 @@ export class SettingsScopeDO {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.accept();
-    this.sessions.add(server);
-
-    server.addEventListener("close", () => {
-      this.sessions.delete(server);
-    });
-
-    server.addEventListener("error", () => {
-      this.sessions.delete(server);
-    });
+    this.state.acceptWebSocket(server);
 
     this.sendCurrentState(server);
 
@@ -130,6 +120,26 @@ export class SettingsScopeDO {
       status: 101,
       webSocket: client
     });
+  }
+
+  webSocketMessage(_socket, _message) {
+    // The existing protocol is server-push only; client messages are ignored.
+  }
+
+  webSocketClose(socket, code, reason, _wasClean) {
+    try {
+      socket.close(code, reason);
+    } catch {
+      // The socket may already be closed.
+    }
+  }
+
+  webSocketError(socket, _error) {
+    try {
+      socket.close(1011, "WebSocket error");
+    } catch {
+      // The socket may already be closed.
+    }
   }
 
   async handleNotify(request, scope) {
