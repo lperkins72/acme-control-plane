@@ -12,12 +12,13 @@ const MAX_PRIMARY_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_FOOTER_UPLOAD_BYTES = 12 * 1024 * 1024;
 const MAX_MAIN_OVERLAY_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_TRIVIA_OVERLAY_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_TRIVIA_THEME_UPLOAD_BYTES = 2 * 1024 * 1024;
 const MAX_LARGE_VIDEO_UPLOAD_BYTES = 300 * 1024 * 1024;
 const MULTIPART_UPLOAD_PART_BYTES = 20 * 1024 * 1024;
 const MAX_MULTIPART_PART_BYTES = 24 * 1024 * 1024;
 const MAX_FORM_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
-const VALID_ZONES = new Set(["primary", "secondary", "trivia", "footer", "main-overlay", "trivia-overlay"]);
-const REGION_SCOPED_ZONES = new Set(["primary", "secondary", "trivia", "footer", "main-overlay", "trivia-overlay"]);
+const VALID_ZONES = new Set(["primary", "secondary", "trivia", "footer", "main-overlay", "trivia-overlay", "trivia-theme"]);
+const REGION_SCOPED_ZONES = new Set(["primary", "secondary", "trivia", "footer", "main-overlay", "trivia-overlay", "trivia-theme"]);
 const DEVICE_SCOPED_ZONES = new Set(["primary", "secondary"]);
 const ALLOWED_OVERRIDE_MODES = new Set(["region-default", "device-override", "device-only"]);
 const MAIN_OVERLAY_INTERVALS = new Set([15, 30, 60]);
@@ -51,6 +52,10 @@ const FOOTER_UPLOAD_TYPES = new Set([
   "image/gif",
   "image/svg+xml"
 ]);
+const TRIVIA_THEME_UPLOAD_TYPES = new Set([
+  "image/png",
+  "image/webp"
+]);
 const VIDEO_UPLOAD_TYPES = new Set(["video/mp4", "video/webm", "video/ogg"]);
 const UPLOAD_ZONE_CONFIG = Object.freeze({
   "primary-assets": {
@@ -76,6 +81,12 @@ const UPLOAD_ZONE_CONFIG = Object.freeze({
     defaultName: "trivia-overlay-asset",
     types: TRIVIA_OVERLAY_UPLOAD_TYPES,
     standardMaxBytes: MAX_TRIVIA_OVERLAY_UPLOAD_BYTES
+  },
+  "trivia-theme-assets": {
+    zone: "trivia-theme",
+    defaultName: "trivia-theme-asset",
+    types: TRIVIA_THEME_UPLOAD_TYPES,
+    standardMaxBytes: MAX_TRIVIA_THEME_UPLOAD_BYTES
   }
 });
 const CONTENT_TYPE_BY_EXTENSION = new Map([
@@ -1970,6 +1981,110 @@ export default {
       const parts = path.split("/").filter(Boolean);
       const tenant = normalizeTenant(parts[2] || "");
       const region = normalizeRegion(parts[4] || "");
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 6 &&
+        parts[3] === "regions" &&
+        parts[5] === "trivia-theme-assets" &&
+        request.method === "GET"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        return json(await buildOverlayAssetsResponse(env, request, tenant, region, "trivia-theme"));
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "trivia-theme-assets" &&
+        parts[6] === "upload" &&
+        request.method === "POST"
+      ) {
+        if (!isOriginAllowed(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        if (!env.SCREENS_BUCKET) {
+          return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+        }
+        const contentLength = Number(request.headers.get("Content-Length") || 0);
+        if (contentLength > MAX_TRIVIA_THEME_UPLOAD_BYTES + MAX_FORM_UPLOAD_OVERHEAD_BYTES) {
+          return json({ ok: false, error: "payload_too_large" }, 413);
+        }
+
+        const formData = await request.formData();
+        const file = formData.get("file");
+        if (!(file instanceof File)) {
+          return json({ ok: false, error: "file_required" }, 400);
+        }
+        if (file.size <= 0 || file.size > MAX_TRIVIA_THEME_UPLOAD_BYTES) {
+          return json({ ok: false, error: "invalid_file_size" }, 400);
+        }
+
+        const contentType = resolveUploadContentType(file.name, file.type);
+        if (!TRIVIA_THEME_UPLOAD_TYPES.has(contentType)) {
+          return json({ ok: false, error: "unsupported_file_type" }, 400);
+        }
+
+        const baseName = sanitizeFileSegment(basenameWithoutExtension(file.name) || "trivia-theme-asset") || "trivia-theme-asset";
+        const extension = extname(file.name) || (contentType === "image/webp" ? ".webp" : ".png");
+        const assetName = `${Date.now()}-${baseName}${extension}`;
+        const r2Key = buildZoneAssetR2Key(tenant, region, "trivia-theme", assetName);
+        const publicUrl = buildZoneAssetPublicUrl(request, tenant, region, "trivia-theme", assetName);
+        const arrayBuffer = await file.arrayBuffer();
+
+        await env.SCREENS_BUCKET.put(r2Key, arrayBuffer, {
+          httpMetadata: { contentType }
+        });
+
+        const nowIso = new Date().toISOString();
+        await env.DB.prepare(`
+          INSERT INTO region_assets
+          (tenant, region, zone, r2_key, public_url, filename_original, filename_display, content_type, size_bytes, status, created_by, created_at, updated_at)
+          VALUES (?, ?, 'trivia-theme', ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        `).bind(
+          tenant,
+          region,
+          r2Key,
+          publicUrl,
+          sanitizeString(file.name, 240),
+          assetName,
+          contentType,
+          file.size,
+          normalizeUpdatedBy(formData.get("updatedBy"), "portal-admin"),
+          nowIso,
+          nowIso
+        ).run();
+
+        return json({
+          ok: true,
+          asset: {
+            tenant,
+            region,
+            zone: "trivia-theme",
+            src: publicUrl,
+            public_url: publicUrl,
+            filename_original: sanitizeString(file.name, 240),
+            filename_display: assetName,
+            label: sanitizeString(file.name, 240),
+            content_type: contentType,
+            size_bytes: file.size,
+            type: "image",
+            source: "uploaded",
+            created_at: nowIso
+          }
+        });
+      }
 
       if (
         tenant &&
