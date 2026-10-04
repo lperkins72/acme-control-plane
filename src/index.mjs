@@ -153,6 +153,12 @@ function isOriginAllowed(request, env) {
   );
 }
 
+function isTrustedPortalWriteOrigin(request, env) {
+  const origin = String(request.headers.get("Origin") || "").trim();
+  if (!origin || origin === "null") return false;
+  return isOriginAllowed(request, env);
+}
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -2008,7 +2014,7 @@ export default {
         parts[6] === "upload" &&
         request.method === "POST"
       ) {
-        if (!isOriginAllowed(request, env)) {
+        if (!isTrustedPortalWriteOrigin(request, env)) {
           return json({ ok: false, error: "origin_not_allowed" }, 403);
         }
         if (!env.DB) {
