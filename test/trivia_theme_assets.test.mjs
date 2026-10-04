@@ -22,3 +22,7 @@ test("theme uploads accept only PNG or WebP and are capped at 2 MiB", () => {
   assert.match(source, /const TRIVIA_THEME_UPLOAD_TYPES = new Set\(\[\s*"image\/png",\s*"image\/webp"\s*\]\)/);
   assert.match(source, /file\.size > MAX_TRIVIA_THEME_UPLOAD_BYTES/);
 });
+
+test("malformed theme upload forms fail closed with a client error", () => {
+  assert.match(source, /formData = await request\.formData\(\);[\s\S]*?error: "invalid_form_data"/);
+});

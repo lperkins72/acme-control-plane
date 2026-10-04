@@ -2028,7 +2028,12 @@ export default {
           return json({ ok: false, error: "payload_too_large" }, 413);
         }
 
-        const formData = await request.formData();
+        let formData;
+        try {
+          formData = await request.formData();
+        } catch {
+          return json({ ok: false, error: "invalid_form_data" }, 400);
+        }
         const file = formData.get("file");
         if (!(file instanceof File)) {
           return json({ ok: false, error: "file_required" }, 400);
