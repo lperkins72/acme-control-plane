@@ -17,8 +17,8 @@ test("theme uploads require an explicit allowlisted portal origin", () => {
   assert.match(source, /parts\[6\] === "upload"[\s\S]*?isTrustedPortalWriteOrigin\(request, env\)/);
 });
 
-test("theme uploads accept only PNG or WebP and are capped at 2 MiB", () => {
-  assert.match(source, /MAX_TRIVIA_THEME_UPLOAD_BYTES = 2 \* 1024 \* 1024/);
+test("theme uploads accept only PNG or WebP and are capped at 25 MiB", () => {
+  assert.match(source, /MAX_TRIVIA_THEME_UPLOAD_BYTES = 25 \* 1024 \* 1024/);
   assert.match(source, /const TRIVIA_THEME_UPLOAD_TYPES = new Set\(\[\s*"image\/png",\s*"image\/webp"\s*\]\)/);
   assert.match(source, /file\.size > MAX_TRIVIA_THEME_UPLOAD_BYTES/);
 });
