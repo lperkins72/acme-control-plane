@@ -971,6 +971,34 @@ async function readActiveRegionAssetById(env, tenant, region, zone, assetId) {
   };
 }
 
+export function listTriviaThemeAssetReferences(stateValue, assetUrl) {
+  const state = isPlainObject(stateValue) ? stateValue : {};
+  const target = sanitizeString(assetUrl, 500);
+  const themes = [];
+  if (!target) {
+    return { logo: false, themes };
+  }
+
+  for (const theme of Array.isArray(state.triviaThemes) ? state.triviaThemes : []) {
+    if (!isPlainObject(theme)) continue;
+    const roles = [];
+    if (sanitizeString(theme.questionImage, 500) === target) roles.push("question");
+    if (sanitizeString(theme.answerImage, 500) === target) roles.push("answer");
+    if (roles.length) {
+      themes.push({
+        id: sanitizeString(theme.id, 120),
+        name: sanitizeString(theme.name, 120) || sanitizeString(theme.id, 120) || "Unnamed theme",
+        roles
+      });
+    }
+  }
+
+  return {
+    logo: sanitizeString(state.logoImage, 500) === target,
+    themes
+  };
+}
+
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -2094,6 +2122,45 @@ export default {
             source: "uploaded",
             created_at: nowIso
           }
+        });
+      }
+
+      if (
+        tenant &&
+        region &&
+        parts.length === 7 &&
+        parts[3] === "regions" &&
+        parts[5] === "trivia-theme-assets" &&
+        request.method === "DELETE"
+      ) {
+        if (!isTrustedPortalWriteOrigin(request, env)) {
+          return json({ ok: false, error: "origin_not_allowed" }, 403);
+        }
+        if (!env.DB) {
+          return json({ ok: false, error: "db_unavailable" }, 503);
+        }
+        if (!env.SCREENS_BUCKET) {
+          return json({ ok: false, error: "asset_bucket_unavailable" }, 503);
+        }
+
+        const asset = await readActiveRegionAssetById(env, tenant, region, "trivia-theme", parts[6]);
+        if (!asset) {
+          return json({ ok: false, error: "asset_not_found" }, 404);
+        }
+
+        const triviaScope = `bdn:v1:tenant:${tenant}:region:${region}:zone:trivia`;
+        const currentTrivia = await readCurrentScopeState(env, triviaScope);
+        const references = listTriviaThemeAssetReferences(currentTrivia.state, asset.public_url);
+        if (references.logo || references.themes.length) {
+          return json({ ok: false, error: "asset_in_use", references }, 409);
+        }
+
+        await env.SCREENS_BUCKET.delete(asset.r2_key);
+        await markRegionAssetDeleted(env, asset, "portal-admin");
+        return json({
+          ok: true,
+          deleted_asset_id: asset.asset_id,
+          zone: "trivia-theme"
         });
       }
 
